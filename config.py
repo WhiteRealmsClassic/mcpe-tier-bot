@@ -149,3 +149,12 @@ TIER_RANK = {
     tier: i
     for i, tier in enumerate(TIERS)
 }
+
+# ======================================================
+# TIER POINTS
+# ======================================================
+
+TIER_POINTS = {
+    tier: (len(TIERS) - rank) * 100
+    for tier, rank in TIER_RANK.items()
+}
