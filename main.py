@@ -18,18 +18,25 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+
+    server = HTTPServer(
+        ("0.0.0.0", port),
+        HealthHandler
+    )
+
     server.serve_forever()
 
 
 def main():
+    # Start Render health server
     threading.Thread(
         target=start_health_server,
         daemon=True
     ).start()
 
+    # Start Discord bot
     bot = TierBot()
-    bot.run()
+    bot.run(os.environ["DISCORD_TOKEN"])
 
 
 if __name__ == "__main__":
