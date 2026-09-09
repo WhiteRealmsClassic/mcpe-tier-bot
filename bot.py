@@ -31,7 +31,6 @@ def bar(n):
 def add_server_logo(embed):
 
     if SERVER_LOGO_URL:
-
         embed.set_thumbnail(
             url=SERVER_LOGO_URL
         )
@@ -55,11 +54,7 @@ class TierBot(commands.Bot):
 
         intents.guilds = True
         intents.members = True
-
-        # TTS requires voice state events
         intents.voice_states = True
-
-        # TTS requires reading Voice Channel Text Chat
         intents.message_content = True
 
         super().__init__(
@@ -89,9 +84,9 @@ class TierBot(commands.Bot):
             pitch=TTS_PITCH
         )
 
-    # ==================================================
+    # ======================================================
     # SETUP
-    # ==================================================
+    # ======================================================
 
     async def setup_hook(self):
 
@@ -131,9 +126,9 @@ class TierBot(commands.Bot):
             guild=guild
         )
 
-    # ==================================================
+    # ======================================================
     # READY
-    # ==================================================
+    # ======================================================
 
     async def on_ready(self):
 
@@ -155,13 +150,50 @@ class TierBot(commands.Bot):
             f"TTS voice: {TTS_VOICE}"
         )
 
+        # ==================================================
+        # TTS AUTO JOIN
+        # ==================================================
+
+        if TTS_ENABLED:
+
+            print(
+                "[TTS] Starting automatic "
+                "voice-channel check..."
+            )
+
+            await self.tts.auto_join()
+
+        # ==================================================
+        # SLASH COMMAND SYNC
+        # ==================================================
+
+        try:
+
+            synced = await self.tree.sync()
+
+            print(
+                f"Synced {len(synced)} slash commands"
+            )
+
+        except Exception as error:
+
+            print(
+                f"Slash command sync failed: {error}"
+            )
+
+        # ==================================================
+        # REFRESH PANELS
+        # ==================================================
+
         await self.refresh_apply_message()
+
         await self.refresh_queue_message()
+
         await self.refresh_leaderboard()
 
-    # ==================================================
+    # ======================================================
     # TTS VOICE STATE
-    # ==================================================
+    # ======================================================
 
     async def on_voice_state_update(
         self,
@@ -173,7 +205,6 @@ class TierBot(commands.Bot):
         if not TTS_ENABLED:
             return
 
-        # Only use TTS in the configured server
         if member.guild.id != GUILD_ID:
             return
 
@@ -183,9 +214,9 @@ class TierBot(commands.Bot):
             after
         )
 
-    # ==================================================
+    # ======================================================
     # TTS MESSAGE READER
-    # ==================================================
+    # ======================================================
 
     async def on_message(
         self,
@@ -251,16 +282,8 @@ class TierBot(commands.Bot):
 
         if voice_client and voice_client.is_connected():
 
-            # --------------------------------------------------
-            # IMPORTANT
-            #
-            # Voice Channel Text Chat uses the same channel ID
-            # as the voice channel.
-            #
-            # We compare IDs rather than relying on
-            # isinstance(message.channel, discord.VoiceChannel)
-            # so this works across discord.py versions.
-            # --------------------------------------------------
+            # Voice Channel Text Chat uses the same
+            # channel ID as the voice channel.
 
             if (
                 voice_client.channel
@@ -272,7 +295,7 @@ class TierBot(commands.Bot):
 
                 if text:
 
-                    # Don't read prefix commands aloud
+                    # Don't read prefix commands
                     if not text.startswith("!"):
 
                         if len(text) > 500:
@@ -300,9 +323,9 @@ class TierBot(commands.Bot):
             message
         )
 
-    # ==================================================
+    # ======================================================
     # STAFF
-    # ==================================================
+    # ======================================================
 
     def has_staff(self, member):
 
@@ -324,9 +347,9 @@ class TierBot(commands.Bot):
             )
         )
 
-    # ==================================================
+    # ======================================================
     # SETTINGS
-    # ==================================================
+    # ======================================================
 
     def get_message_id(self, key):
 
@@ -359,9 +382,9 @@ class TierBot(commands.Bot):
             message_id
         )
 
-    # ==================================================
+    # ======================================================
     # REAL ACTIVE TICKET
-    # ==================================================
+    # ======================================================
 
     async def get_real_active_ticket(
         self,
@@ -411,9 +434,9 @@ class TierBot(commands.Bot):
 
         return None
 
-    # ==================================================
+    # ======================================================
     # APPLY EMBED
-    # ==================================================
+    # ======================================================
 
     def apply_embed(self):
 
@@ -444,9 +467,9 @@ class TierBot(commands.Bot):
             embed
         )
 
-    # ==================================================
+    # ======================================================
     # APPLY PANEL
-    # ==================================================
+    # ======================================================
 
     async def refresh_apply_message(self):
 
@@ -520,9 +543,9 @@ class TierBot(commands.Bot):
             message.id
         )
 
-    # ==================================================
+    # ======================================================
     # QUEUE EMBED
-    # ==================================================
+    # ======================================================
 
     def queue_embed(self):
 
@@ -561,9 +584,9 @@ class TierBot(commands.Bot):
             embed
         )
 
-    # ==================================================
+    # ======================================================
     # QUEUE REFRESH
-    # ==================================================
+    # ======================================================
 
     async def refresh_queue_message(self):
 
@@ -639,9 +662,9 @@ class TierBot(commands.Bot):
                 message.id
             )
 
-    # ==================================================
+    # ======================================================
     # GLOBAL LEADERBOARD
-    # ==================================================
+    # ======================================================
 
     def global_leaderboard_embed(self):
 
@@ -715,9 +738,9 @@ class TierBot(commands.Bot):
             embed
         )
 
-    # ==================================================
+    # ======================================================
     # GAMEMODE LEADERBOARD
-    # ==================================================
+    # ======================================================
 
     def leaderboard_embed(
         self,
@@ -784,9 +807,9 @@ class TierBot(commands.Bot):
             embed
         )
 
-    # ==================================================
+    # ======================================================
     # LEADERBOARD REFRESH
-    # ==================================================
+    # ======================================================
 
     async def refresh_leaderboard(
         self,
@@ -871,9 +894,9 @@ class TierBot(commands.Bot):
             message.id
         )
 
-    # ==================================================
+    # ======================================================
     # AUDIT
-    # ==================================================
+    # ======================================================
 
     async def log(self, text):
 
@@ -1700,6 +1723,7 @@ class ResultModal(
         )
 
         await self.bot.refresh_queue_message()
+
         await self.bot.refresh_leaderboard()
 
         await self.bot.log(
@@ -1988,7 +2012,9 @@ async def setup(
     )
 
     await bot.refresh_apply_message()
+
     await bot.refresh_queue_message()
+
     await bot.refresh_leaderboard()
 
     await interaction.followup.send(
@@ -2073,10 +2099,6 @@ async def stats(
         inline=True
     )
 
-    # ==================================================
-    # GAMEMODES
-    # ==================================================
-
     gamemode_lines = []
 
     main_gamemode = None
@@ -2142,10 +2164,6 @@ async def stats(
         value=main_name,
         inline=False
     )
-
-    # ==================================================
-    # AVATAR
-    # ==================================================
 
     avatar = username.display_avatar.url
 
