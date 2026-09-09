@@ -4,3 +4,4 @@ discord.py
 PyNaCl
 edge-tts
 python-dotenv
+imageio-ffmpeg>=0.6.0
