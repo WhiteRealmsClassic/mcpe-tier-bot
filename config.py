@@ -11,18 +11,15 @@ load_dotenv()
 # ======================================================
 
 def req(name: str) -> int:
-
     value = os.getenv(
         name,
         "0"
     )
 
     try:
-
         return int(value)
 
     except ValueError:
-
         raise RuntimeError(
             f"{name} must be an integer"
         )
@@ -83,6 +80,12 @@ AUDIT_CHANNEL_ID = req(
     "AUDIT_CHANNEL_ID"
 )
 
+# SQLite database location
+DB_PATH = os.getenv(
+    "DB_PATH",
+    "data/tierbot.db"
+)
+
 TICKET_CLOSE_DELAY = int(
     os.getenv(
         "TICKET_CLOSE_DELAY",
@@ -115,7 +118,7 @@ TTS_ENABLED = os.getenv(
     "on"
 )
 
-# Indian English male
+# Indian English male voice
 TTS_VOICE = os.getenv(
     "TTS_VOICE",
     "en-IN-PrabhatNeural"
@@ -142,7 +145,6 @@ TTS_PITCH = os.getenv(
 # ======================================================
 
 if not TOKEN:
-
     raise RuntimeError(
         "DISCORD_TOKEN is missing"
     )
@@ -253,6 +255,10 @@ TIERS = [
 ]
 
 
+# ======================================================
+# TIER RANK
+# ======================================================
+
 TIER_RANK = {
     tier: i
     for i, tier in enumerate(
@@ -260,6 +266,10 @@ TIER_RANK = {
     )
 }
 
+
+# ======================================================
+# TIER POINTS
+# ======================================================
 
 TIER_POINTS = {
     tier: (
