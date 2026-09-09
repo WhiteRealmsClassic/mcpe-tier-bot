@@ -23,18 +23,12 @@ def emoji(gm):
 
 
 def bar(n):
-    """
-    15-slot queue progress bar.
-    """
     n = max(0, min(15, n))
     return "■" * n + "□" * (15 - n)
 
 
 def add_server_logo(embed):
-    """
-    Adds the configured server logo to the top-right
-    of the Discord embed as a thumbnail.
-    """
+
     if SERVER_LOGO_URL:
         embed.set_thumbnail(
             url=SERVER_LOGO_URL
@@ -64,9 +58,15 @@ class TierBot(commands.Bot):
 
         self.refresh_lock = asyncio.Lock()
 
+    # ==================================================
+    # SETUP
+    # ==================================================
+
     async def setup_hook(self):
 
-        await self.load_extension("moderation")
+        await self.load_extension(
+            "moderation"
+        )
 
         self.add_view(
             ApplyView(self)
@@ -100,11 +100,20 @@ class TierBot(commands.Bot):
             guild=guild
         )
 
+    # ==================================================
+    # READY
+    # ==================================================
+
     async def on_ready(self):
 
         print(
             f"Logged in as {self.user} "
             f"({self.user.id})"
+        )
+
+        print(
+            f"Database integrity: "
+            f"{self.db.integrity_check()}"
         )
 
         await self.refresh_apply_message()
@@ -153,7 +162,6 @@ class TierBot(commands.Bot):
             return None
 
         try:
-
             return int(
                 row["value"]
             )
@@ -209,8 +217,6 @@ class TierBot(commands.Bot):
         if guild is None:
             return ticket
 
-        channel = None
-
         try:
 
             channel = await guild.fetch_channel(
@@ -222,6 +228,7 @@ class TierBot(commands.Bot):
             discord.Forbidden,
             discord.HTTPException
         ):
+
             channel = None
 
         if channel is not None:
@@ -229,7 +236,8 @@ class TierBot(commands.Bot):
 
         self.db.close_ticket(
             ticket["channel_id"],
-            now()
+            now(),
+            "channel_missing"
         )
 
         self.db.queue_remove(
@@ -311,10 +319,19 @@ class TierBot(commands.Bot):
 
         if not message:
 
-            message = await channel.send(
-                embed=self.apply_embed(),
-                view=ApplyView(self)
-            )
+            try:
+
+                message = await channel.send(
+                    embed=self.apply_embed(),
+                    view=ApplyView(self)
+                )
+
+            except (
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+
+                return
 
         else:
 
@@ -398,7 +415,28 @@ class TierBot(commands.Bot):
                 "queue_message_id"
             )
 
-            if not message_id:
+            message = None
+
+            if message_id:
+
+                try:
+
+                    message = await channel.fetch_message(
+                        message_id
+                    )
+
+                except discord.NotFound:
+
+                    message = None
+
+                except (
+                    discord.Forbidden,
+                    discord.HTTPException
+                ):
+
+                    return
+
+            if not message:
 
                 try:
 
@@ -414,24 +452,12 @@ class TierBot(commands.Bot):
 
                     return
 
-                self.save_message_id(
-                    "queue_message_id",
-                    message.id
-                )
-
-                return
-
-            try:
-
-                message = await channel.fetch_message(
-                    message_id
-                )
-
-            except discord.NotFound:
+            else:
 
                 try:
 
-                    message = await channel.send(
+                    await message.edit(
+                        content=None,
                         embed=self.queue_embed(),
                         view=QueueView(self)
                     )
@@ -443,34 +469,10 @@ class TierBot(commands.Bot):
 
                     return
 
-                self.save_message_id(
-                    "queue_message_id",
-                    message.id
-                )
-
-                return
-
-            except (
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-
-                return
-
-            try:
-
-                await message.edit(
-                    content=None,
-                    embed=self.queue_embed(),
-                    view=QueueView(self)
-                )
-
-            except (
-                discord.Forbidden,
-                discord.HTTPException
-            ):
-
-                return
+            self.save_message_id(
+                "queue_message_id",
+                message.id
+            )
 
     # ==================================================
     # GLOBAL LEADERBOARD
@@ -525,7 +527,8 @@ class TierBot(commands.Bot):
             lines.append(
                 f"{medal} "
                 f"`{row['minecraft_username']}` "
-                f"| **{row['total_points']}pts**"
+                f"| **{row['total_points']}pts** "
+                f"| `{row['tests']} tests`"
             )
 
         embed.add_field(
@@ -560,43 +563,8 @@ class TierBot(commands.Bot):
                 iter(GAMEMODES)
             )
 
-        rows = self.db.latest_results()
-
-        players = {}
-
-        for row in rows:
-
-            if row["gamemode"] != selected_gm:
-                continue
-
-            user_id = row["user_id"]
-
-            if user_id not in players:
-
-                players[user_id] = row
-                continue
-
-            old = players[user_id]
-
-            if (
-                row["points"] > old["points"]
-                or (
-                    row["points"] == old["points"]
-                    and row["id"] > old["id"]
-                )
-            ):
-
-                players[user_id] = row
-
-        entries = list(
-            players.values()
-        )
-
-        entries.sort(
-            key=lambda row: (
-                -row["points"],
-                row["id"]
-            )
+        rows = self.db.gamemode_leaderboard(
+            selected_gm
         )
 
         embed = discord.Embed(
@@ -609,7 +577,7 @@ class TierBot(commands.Bot):
             f"**{GAMEMODES[selected_gm][0]}**"
         )
 
-        if not entries:
+        if not rows:
 
             embed.add_field(
                 name="Rankings",
@@ -622,15 +590,15 @@ class TierBot(commands.Bot):
             lines = []
 
             for index, row in enumerate(
-                entries[:20],
+                rows[:20],
                 1
             ):
 
                 lines.append(
                     f"`#{index}` "
                     f"`{row['minecraft_username']}` "
-                    f"| **No Region** "
-                    f"| **{row['points']}pts**"
+                    f"| **{row['total_points']}pts** "
+                    f"| `{row['tests']} tests`"
                 )
 
             embed.add_field(
@@ -691,7 +659,9 @@ class TierBot(commands.Bot):
         embed = (
             self.global_leaderboard_embed()
             if selected_gm == "global"
-            else self.leaderboard_embed(selected_gm)
+            else self.leaderboard_embed(
+                selected_gm
+            )
         )
 
         if not message:
@@ -733,7 +703,7 @@ class TierBot(commands.Bot):
         )
 
     # ==================================================
-    # AUDIT LOG
+    # AUDIT
     # ==================================================
 
     async def log(self, text):
@@ -745,7 +715,6 @@ class TierBot(commands.Bot):
         if channel:
 
             try:
-
                 await channel.send(
                     text
                 )
@@ -790,14 +759,9 @@ class ApplyView(discord.ui.View):
                 ephemeral=True
             )
 
-        queued = self.bot.db.conn.execute(
-            """
-            SELECT 1
-            FROM queues
-            WHERE user_id=?
-            """,
-            (interaction.user.id,)
-        ).fetchone()
+        queued = self.bot.db.queue_for_user(
+            interaction.user.id
+        )
 
         if queued:
 
@@ -869,6 +833,15 @@ class GamemodeView(discord.ui.View):
                 ephemeral=True
             )
 
+        if self.bot.db.queue_for_user(
+            interaction.user.id
+        ):
+
+            return await interaction.response.send_message(
+                "You are already in a queue.",
+                ephemeral=True
+            )
+
         gm = self.select.values[0]
 
         if self.bot.db.count(gm) >= 15:
@@ -931,6 +904,20 @@ class QueueModal(
             self.server.value.strip()
         )
 
+        if not minecraft_username:
+
+            return await interaction.response.send_message(
+                "Minecraft username cannot be empty.",
+                ephemeral=True
+            )
+
+        if not preferred_server:
+
+            return await interaction.response.send_message(
+                "Preferred server cannot be empty.",
+                ephemeral=True
+            )
+
         active = await self.bot.get_real_active_ticket(
             interaction.user.id
         )
@@ -942,47 +929,18 @@ class QueueModal(
                 ephemeral=True
             )
 
-        # ==================================================
-        # JOIN 15-PLAYER QUEUE
-        # ==================================================
-
-        ok, reason = self.bot.db.queue_join(
-            interaction.user.id,
-            self.gm,
-            minecraft_username,
-            preferred_server,
-            now(),
-            15
-        )
-
-        if not ok:
-
-            if reason == "already_queued":
-
-                return await interaction.response.send_message(
-                    "You are already in a queue.",
-                    ephemeral=True
-                )
-
-            if reason == "full":
-
-                return await interaction.response.send_message(
-                    "That queue is full (15/15).",
-                    ephemeral=True
-                )
+        if self.bot.db.queue_for_user(
+            interaction.user.id
+        ):
 
             return await interaction.response.send_message(
-                "Unable to join the queue.",
+                "You are already in a queue.",
                 ephemeral=True
             )
 
         guild = interaction.guild
 
         if guild is None:
-
-            self.bot.db.queue_remove(
-                interaction.user.id
-            )
 
             return await interaction.response.send_message(
                 "This request must be made inside the Discord server.",
@@ -995,12 +953,41 @@ class QueueModal(
 
         if category is None:
 
-            self.bot.db.queue_remove(
-                interaction.user.id
-            )
-
             return await interaction.response.send_message(
                 "The ticket category could not be found.",
+                ephemeral=True
+            )
+
+        ok, reason = self.bot.db.queue_join(
+            interaction.user.id,
+            self.gm,
+            minecraft_username,
+            preferred_server,
+            now(),
+            15
+        )
+
+        if not ok:
+
+            messages = {
+                "already_queued":
+                    "You are already in a queue.",
+
+                "full":
+                    "That queue is full (15/15).",
+
+                "invalid_username":
+                    "Invalid Minecraft username.",
+
+                "invalid_server":
+                    "Invalid preferred server."
+            }
+
+            return await interaction.response.send_message(
+                messages.get(
+                    reason,
+                    "Unable to join the queue."
+                ),
                 ephemeral=True
             )
 
@@ -1047,6 +1034,8 @@ class QueueModal(
                 )
             )
 
+        channel = None
+
         try:
 
             channel = await guild.create_text_channel(
@@ -1056,7 +1045,7 @@ class QueueModal(
                 reason="MCPE tier test ticket"
             )
 
-            self.bot.db.create_ticket(
+            created = self.bot.db.create_ticket(
                 channel.id,
                 interaction.user.id,
                 self.gm,
@@ -1065,11 +1054,35 @@ class QueueModal(
                 now()
             )
 
+            if not created:
+
+                await channel.delete(
+                    reason="Duplicate ticket prevention"
+                )
+
+                self.bot.db.queue_remove(
+                    interaction.user.id
+                )
+
+                return await interaction.response.send_message(
+                    "You already have an active test ticket.",
+                    ephemeral=True
+                )
+
         except Exception:
 
             self.bot.db.queue_remove(
                 interaction.user.id
             )
+
+            if channel:
+
+                try:
+                    await channel.delete(
+                        reason="Ticket creation failed"
+                    )
+                except discord.HTTPException:
+                    pass
 
             raise
 
@@ -1348,35 +1361,12 @@ class ResultModal(
             self.verdict.value.strip()
         )
 
-        # ==================================================
-        # VALIDATE TIER
-        # ==================================================
-
         if tier not in TIERS:
 
             return await interaction.response.send_message(
                 "Invalid rank. Use a rank such as HT1, MT2, LT3, etc.",
                 ephemeral=True
             )
-
-        # ==================================================
-        # AUTOMATIC POINT CALCULATION
-        # ==================================================
-
-        try:
-
-            points = TIER_POINTS[tier]
-
-        except KeyError:
-
-            return await interaction.response.send_message(
-                "This tier does not have a configured point value.",
-                ephemeral=True
-            )
-
-        # ==================================================
-        # GET TICKET
-        # ==================================================
 
         ticket = self.bot.db.ticket(
             interaction.channel.id
@@ -1403,10 +1393,7 @@ class ResultModal(
                 ephemeral=True
             )
 
-        # ==================================================
-        # SAVE RESULT
-        # ==================================================
-
+        # Database calculates the actual points.
         saved = self.bot.db.finalize_test(
             channel_id=interaction.channel.id,
             user_id=ticket["user_id"],
@@ -1414,7 +1401,7 @@ class ResultModal(
             gamemode=ticket["gamemode"],
             tier=tier,
             tester_id=interaction.user.id,
-            points=points,
+            points=0,
             match_score=match_score,
             verdict=verdict,
             created_at=now(),
@@ -1428,9 +1415,9 @@ class ResultModal(
                 ephemeral=True
             )
 
-        # ==================================================
-        # REMOVE FROM QUEUE
-        # ==================================================
+        points = self.bot.db.points_for_tier(
+            tier
+        )
 
         self.bot.db.queue_remove(
             ticket["user_id"]
@@ -1535,32 +1522,19 @@ class ResultModal(
                     f"Rank: **{tier}**\n"
                     f"Score: **{match_score}**\n"
                     f"Points: **{points}pts**\n"
-                    f"Verdict: {verdict}"
+                    f"Verdict: {verdict or 'No verdict provided.'}"
                 )
 
             except discord.HTTPException:
                 pass
-
-        # ==================================================
-        # CONFIRM RESULT
-        # ==================================================
 
         await interaction.response.send_message(
             f"Result submitted successfully: **{tier}** • **{points}pts**.\n"
             "This ticket will close shortly."
         )
 
-        # ==================================================
-        # REFRESH PANELS
-        # ==================================================
-
         await self.bot.refresh_queue_message()
-
         await self.bot.refresh_leaderboard()
-
-        # ==================================================
-        # AUDIT LOG
-        # ==================================================
 
         await self.bot.log(
             f"Result: "
@@ -1572,10 +1546,6 @@ class ResultModal(
             f"tester {interaction.user} "
             f"({interaction.user.id})"
         )
-
-        # ==================================================
-        # CLOSE TICKET
-        # ==================================================
 
         await asyncio.sleep(
             TICKET_CLOSE_DELAY
@@ -1631,14 +1601,9 @@ class QueueView(discord.ui.View):
                 ephemeral=True
             )
 
-        queued = self.bot.db.conn.execute(
-            """
-            SELECT *
-            FROM queues
-            WHERE user_id=?
-            """,
-            (interaction.user.id,)
-        ).fetchone()
+        queued = self.bot.db.queue_for_user(
+            interaction.user.id
+        )
 
         if not queued:
 
@@ -1674,7 +1639,8 @@ class QueueView(discord.ui.View):
 
             self.bot.db.close_ticket(
                 ticket["channel_id"],
-                now()
+                now(),
+                "player_left_queue"
             )
 
             if ticket_channel:
@@ -1898,7 +1864,8 @@ async def force_remove(
 
         bot.db.close_ticket(
             ticket["channel_id"],
-            now()
+            now(),
+            "staff_force_removed"
         )
 
         channel = None
@@ -1995,7 +1962,7 @@ async def player_results(
             f"Rank: **{row['tier']}** | "
             f"Score: **{row['match_score']}** | "
             f"Points: **{row['points']}pts**\n"
-            f"{row['verdict']}\n"
+            f"{row['verdict'] or 'No verdict provided.'}\n"
             f"{time_text}"
         )
 
@@ -2051,7 +2018,8 @@ async def close_ticket(
 
     bot.db.close_ticket(
         interaction.channel.id,
-        now()
+        now(),
+        "staff_closed"
     )
 
     await bot.refresh_queue_message()
