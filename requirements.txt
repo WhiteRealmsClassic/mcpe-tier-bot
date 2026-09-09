@@ -1,2 +1,6 @@
 discord.py>=2.6,<3
 python-dotenv>=1.0,<2
+discord.py
+PyNaCl
+edge-tts
+python-dotenv
