@@ -395,10 +395,6 @@ class TierBot(commands.Bot):
                 "queue_message_id"
             )
 
-            # ==========================================
-            # NO SAVED MESSAGE
-            # ==========================================
-
             if not message_id:
 
                 try:
@@ -421,10 +417,6 @@ class TierBot(commands.Bot):
                 )
 
                 return
-
-            # ==========================================
-            # FETCH EXISTING MESSAGE
-            # ==========================================
 
             try:
 
@@ -461,10 +453,6 @@ class TierBot(commands.Bot):
             ):
 
                 return
-
-            # ==========================================
-            # EDIT EXISTING MESSAGE
-            # ==========================================
 
             try:
 
@@ -697,16 +685,27 @@ class TierBot(commands.Bot):
 
                 return
 
+        embed = (
+            self.global_leaderboard_embed()
+            if selected_gm == "global"
+            else self.leaderboard_embed(selected_gm)
+        )
+
         if not message:
 
-            message = await channel.send(
-                embed=(
-                    self.global_leaderboard_embed()
-                    if selected_gm == "global"
-                    else self.leaderboard_embed(selected_gm)
-                ),
-                view=LeaderboardView(self)
-            )
+            try:
+
+                message = await channel.send(
+                    embed=embed,
+                    view=LeaderboardView(self)
+                )
+
+            except (
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+
+                return
 
         else:
 
@@ -714,11 +713,7 @@ class TierBot(commands.Bot):
 
                 await message.edit(
                     content=None,
-                    embed=(
-                        self.global_leaderboard_embed()
-                        if selected_gm == "global"
-                        else self.leaderboard_embed(selected_gm)
-                    ),
+                    embed=embed,
                     view=LeaderboardView(self)
                 )
 
@@ -1346,6 +1341,10 @@ class ResultModal(
             self.verdict.value.strip()
         )
 
+        # ==================================================
+        # VALIDATE TIER
+        # ==================================================
+
         if tier not in TIERS:
 
             return await interaction.response.send_message(
@@ -1357,16 +1356,20 @@ class ResultModal(
         # AUTOMATIC POINT CALCULATION
         # ==================================================
 
-        points = self.bot.db.points_for_tier(
-            tier
-        )
+        try:
 
-        if points is None:
+            points = TIER_POINTS[tier]
+
+        except KeyError:
 
             return await interaction.response.send_message(
-                "Unable to calculate points for that tier.",
+                "This tier does not have a configured point value.",
                 ephemeral=True
             )
+
+        # ==================================================
+        # GET TICKET
+        # ==================================================
 
         ticket = self.bot.db.ticket(
             interaction.channel.id
@@ -1393,6 +1396,10 @@ class ResultModal(
                 ephemeral=True
             )
 
+        # ==================================================
+        # SAVE RESULT
+        # ==================================================
+
         saved = self.bot.db.finalize_test(
             channel_id=interaction.channel.id,
             user_id=ticket["user_id"],
@@ -1414,9 +1421,17 @@ class ResultModal(
                 ephemeral=True
             )
 
+        # ==================================================
+        # REMOVE FROM QUEUE
+        # ==================================================
+
         self.bot.db.queue_remove(
             ticket["user_id"]
         )
+
+        # ==================================================
+        # RESULTS CHANNEL
+        # ==================================================
 
         results = self.bot.get_channel(
             RESULTS_CHANNEL_ID
@@ -1490,6 +1505,10 @@ class ResultModal(
                 embed=embed
             )
 
+        # ==================================================
+        # TIER ROLE + DM
+        # ==================================================
+
         member = interaction.guild.get_member(
             ticket["user_id"]
         )
@@ -1515,14 +1534,26 @@ class ResultModal(
             except discord.HTTPException:
                 pass
 
+        # ==================================================
+        # CONFIRM RESULT
+        # ==================================================
+
         await interaction.response.send_message(
             f"Result submitted successfully: **{tier}** • **{points}pts**.\n"
             "This ticket will close shortly."
         )
 
+        # ==================================================
+        # REFRESH PANELS
+        # ==================================================
+
         await self.bot.refresh_queue_message()
 
         await self.bot.refresh_leaderboard()
+
+        # ==================================================
+        # AUDIT LOG
+        # ==================================================
 
         await self.bot.log(
             f"Result: "
@@ -1534,6 +1565,10 @@ class ResultModal(
             f"tester {interaction.user} "
             f"({interaction.user.id})"
         )
+
+        # ==================================================
+        # CLOSE TICKET
+        # ==================================================
 
         await asyncio.sleep(
             TICKET_CLOSE_DELAY
