@@ -23,8 +23,8 @@ def emoji(gm):
 
 
 def bar(n):
-    n = max(0, min(10, n))
-    return "■" * n + "□" * (10 - n)
+    n = max(0, min(5, n))
+    return "■" * n + "□" * (5 - n)
 
 
 def add_server_logo(embed):
@@ -362,7 +362,7 @@ class TierBot(commands.Bot):
                     f"{data[0]}"
                 ),
                 value=(
-                    f"**{count}/10**\n"
+                    f"**{count}/5**\n"
                     f"`{bar(count)}`"
                 ),
                 inline=False
@@ -434,9 +434,6 @@ class TierBot(commands.Bot):
 
             except discord.NotFound:
 
-                # The saved message was actually deleted.
-                # Only NOW do we create a replacement.
-
                 try:
 
                     message = await channel.send(
@@ -463,9 +460,6 @@ class TierBot(commands.Bot):
                 discord.HTTPException
             ):
 
-                # Do NOT create a new message.
-                # A temporary Discord/API error should
-                # never cause duplicate queue panels.
                 return
 
             # ==========================================
@@ -488,7 +482,80 @@ class TierBot(commands.Bot):
                 return
 
     # ==================================================
-    # LEADERBOARD EMBED
+    # GLOBAL LEADERBOARD EMBED
+    # ==================================================
+
+    def global_leaderboard_embed(self):
+
+        rows = self.db.global_leaderboard()
+
+        embed = discord.Embed(
+            title="🏆 MCPE Global Leaderboard",
+            description=(
+                "Combined points from **every gamemode**."
+            ),
+            color=discord.Color.gold()
+        )
+
+        if not rows:
+
+            embed.add_field(
+                name="Rankings",
+                value="No tested players yet.",
+                inline=False
+            )
+
+            embed.set_footer(
+                text="Complete a tier test to appear here."
+            )
+
+            return add_server_logo(
+                embed
+            )
+
+        lines = []
+
+        medals = {
+            1: "🥇",
+            2: "🥈",
+            3: "🥉"
+        }
+
+        for index, row in enumerate(
+            rows[:20],
+            1
+        ):
+
+            medal = medals.get(
+                index,
+                f"`#{index}`"
+            )
+
+            lines.append(
+                f"{medal} "
+                f"`{row['minecraft_username']}` "
+                f"| **{row['total_points']}pts**"
+            )
+
+        embed.add_field(
+            name="Global Rankings",
+            value="\n".join(lines),
+            inline=False
+        )
+
+        embed.set_footer(
+            text=(
+                "Points from all completed gamemode "
+                "tests are combined."
+            )
+        )
+
+        return add_server_logo(
+            embed
+        )
+
+    # ==================================================
+    # GAMEMODE LEADERBOARD EMBED
     # ==================================================
 
     def leaderboard_embed(
@@ -593,7 +660,10 @@ class TierBot(commands.Bot):
     # LEADERBOARD REFRESH
     # ==================================================
 
-    async def refresh_leaderboard(self):
+    async def refresh_leaderboard(
+        self,
+        selected_gm=None
+    ):
 
         channel = self.get_channel(
             LEADERBOARD_CHANNEL_ID
@@ -630,7 +700,11 @@ class TierBot(commands.Bot):
         if not message:
 
             message = await channel.send(
-                embed=self.leaderboard_embed(),
+                embed=(
+                    self.global_leaderboard_embed()
+                    if selected_gm == "global"
+                    else self.leaderboard_embed(selected_gm)
+                ),
                 view=LeaderboardView(self)
             )
 
@@ -640,7 +714,11 @@ class TierBot(commands.Bot):
 
                 await message.edit(
                     content=None,
-                    embed=self.leaderboard_embed(),
+                    embed=(
+                        self.global_leaderboard_embed()
+                        if selected_gm == "global"
+                        else self.leaderboard_embed(selected_gm)
+                    ),
                     view=LeaderboardView(self)
                 )
 
@@ -795,10 +873,10 @@ class GamemodeView(discord.ui.View):
 
         gm = self.select.values[0]
 
-        if self.bot.db.count(gm) >= 10:
+        if self.bot.db.count(gm) >= 5:
 
             return await interaction.response.send_message(
-                "That queue is full (10/10).",
+                "That queue is full (5/5).",
                 ephemeral=True
             )
 
@@ -872,7 +950,7 @@ class QueueModal(
             minecraft_username,
             preferred_server,
             now(),
-            10
+            5
         )
 
         if not ok:
@@ -887,7 +965,7 @@ class QueueModal(
             if reason == "full":
 
                 return await interaction.response.send_message(
-                    "That queue is full (10/10).",
+                    "That queue is full (5/5).",
                     ephemeral=True
                 )
 
@@ -1125,8 +1203,10 @@ class TicketView(discord.ui.View):
             description=(
                 "When the match is finished, click "
                 "**Submit Test Result** to submit the "
-                "player's final rank, match score, points "
-                "and custom verdict."
+                "player's final rank, match score "
+                "and custom verdict.\n\n"
+                "Points are assigned automatically "
+                "from the final tier."
             ),
             color=discord.Color.blurple()
         )
@@ -1233,12 +1313,6 @@ class ResultModal(
         max_length=20
     )
 
-    points = discord.ui.TextInput(
-        label="Points",
-        placeholder="Example: 4000",
-        max_length=10
-    )
-
     verdict = discord.ui.TextInput(
         label="Custom Verdict",
         placeholder="Write your verdict for the player...",
@@ -1279,23 +1353,18 @@ class ResultModal(
                 ephemeral=True
             )
 
-        try:
+        # ==================================================
+        # AUTOMATIC POINT CALCULATION
+        # ==================================================
 
-            points = int(
-                self.points.value.strip()
-            )
+        points = self.bot.db.points_for_tier(
+            tier
+        )
 
-        except ValueError:
-
-            return await interaction.response.send_message(
-                "Points must be a whole number.",
-                ephemeral=True
-            )
-
-        if points < 0:
+        if points is None:
 
             return await interaction.response.send_message(
-                "Points cannot be negative.",
+                "Unable to calculate points for that tier.",
                 ephemeral=True
             )
 
@@ -1599,7 +1668,14 @@ class LeaderboardView(discord.ui.View):
 
         self.bot = bot
 
-        options = []
+        options = [
+            discord.SelectOption(
+                label="Global Leaderboard",
+                value="global",
+                emoji="🏆",
+                description="Combined points from every gamemode"
+            )
+        ]
 
         for key, data in GAMEMODES.items():
 
@@ -1615,7 +1691,7 @@ class LeaderboardView(discord.ui.View):
             )
 
         self.select = discord.ui.Select(
-            placeholder="Select Gamemode",
+            placeholder="Select Leaderboard",
             options=options,
             custom_id="tierbot:leaderboard_gamemode"
         )
@@ -1631,10 +1707,20 @@ class LeaderboardView(discord.ui.View):
         interaction
     ):
 
-        gm = self.select.values[0]
+        selection = self.select.values[0]
+
+        if selection == "global":
+
+            embed = self.bot.global_leaderboard_embed()
+
+        else:
+
+            embed = self.bot.leaderboard_embed(
+                selection
+            )
 
         await interaction.response.edit_message(
-            embed=self.bot.leaderboard_embed(gm),
+            embed=embed,
             view=self
         )
 
