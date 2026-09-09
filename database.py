@@ -1,6 +1,9 @@
 import os
-import sqlite3
 from contextlib import contextmanager
+
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
 
 
 class Database:
@@ -31,128 +34,169 @@ class Database:
         "HT1": 1500,
     }
 
-    def __init__(self, path):
-        self.path = path
+    def __init__(self, database_url=None):
 
-        folder = os.path.dirname(path)
-
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-
-        self.conn = sqlite3.connect(
-            self.path,
-            check_same_thread=False
+        self.database_url = (
+            database_url
+            or os.getenv("DATABASE_URL")
         )
 
-        self.conn.row_factory = sqlite3.Row
+        if not self.database_url:
+            raise RuntimeError(
+                "DATABASE_URL environment variable is missing."
+            )
 
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.pool = pool.SimpleConnectionPool(
+            1,
+            5,
+            self.database_url,
+            sslmode="require"
+        )
 
         self.setup()
 
+    # ======================================================
+    # CONNECTION
+    # ======================================================
+
     @contextmanager
-    def transaction(self):
-        self.conn.execute("BEGIN IMMEDIATE")
+    def connection(self):
+
+        conn = self.pool.getconn()
 
         try:
-            yield
-            self.conn.commit()
+            yield conn
 
-        except Exception:
-            self.conn.rollback()
-            raise
+        finally:
+            self.pool.putconn(conn)
+
+    @contextmanager
+    def transaction(self):
+
+        with self.connection() as conn:
+
+            try:
+
+                yield conn
+
+                conn.commit()
+
+            except Exception:
+
+                conn.rollback()
+                raise
+
+    def fetchone(
+        self,
+        query,
+        params=()
+    ):
+
+        with self.connection() as conn:
+
+            with conn.cursor(
+                cursor_factory=RealDictCursor
+            ) as cursor:
+
+                cursor.execute(
+                    query,
+                    params
+                )
+
+                return cursor.fetchone()
+
+    def fetchall(
+        self,
+        query,
+        params=()
+    ):
+
+        with self.connection() as conn:
+
+            with conn.cursor(
+                cursor_factory=RealDictCursor
+            ) as cursor:
+
+                cursor.execute(
+                    query,
+                    params
+                )
+
+                return cursor.fetchall()
+
+    # ======================================================
+    # SETUP
+    # ======================================================
 
     def setup(self):
 
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS queues (
-                user_id INTEGER PRIMARY KEY,
-                gamemode TEXT NOT NULL,
-                minecraft_username TEXT NOT NULL,
-                preferred_server TEXT NOT NULL,
-                joined_at TEXT NOT NULL
-            );
+        with self.transaction() as conn:
 
-            CREATE TABLE IF NOT EXISTS tickets (
-                channel_id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                gamemode TEXT NOT NULL,
-                minecraft_username TEXT NOT NULL,
-                preferred_server TEXT NOT NULL,
-                tester_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'waiting',
-                created_at TEXT NOT NULL,
-                claimed_at TEXT,
-                closed_at TEXT
-            );
+            with conn.cursor() as cursor:
 
-            CREATE TABLE IF NOT EXISTS results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                minecraft_username TEXT NOT NULL,
-                gamemode TEXT NOT NULL,
-                tier TEXT NOT NULL,
-                tester_id INTEGER NOT NULL,
-                points INTEGER NOT NULL DEFAULT 0,
-                match_score TEXT NOT NULL DEFAULT 'N/A',
-                verdict TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                corrected INTEGER NOT NULL DEFAULT 0
-            );
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS queues (
+                        user_id BIGINT PRIMARY KEY,
+                        gamemode TEXT NOT NULL,
+                        minecraft_username TEXT NOT NULL,
+                        preferred_server TEXT NOT NULL,
+                        joined_at TIMESTAMPTZ NOT NULL
+                    );
 
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            """
-        )
+                    CREATE INDEX IF NOT EXISTS
+                    idx_queues_gamemode
+                    ON queues(gamemode);
 
-        # --------------------------------------------------
-        # Upgrade old databases
-        # --------------------------------------------------
+                    CREATE TABLE IF NOT EXISTS tickets (
+                        channel_id BIGINT PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        gamemode TEXT NOT NULL,
+                        minecraft_username TEXT NOT NULL,
+                        preferred_server TEXT NOT NULL,
+                        tester_id BIGINT,
+                        status TEXT NOT NULL DEFAULT 'waiting',
+                        created_at TIMESTAMPTZ NOT NULL,
+                        claimed_at TIMESTAMPTZ,
+                        closed_at TIMESTAMPTZ
+                    );
 
-        columns = {
-            row["name"]
-            for row in self.conn.execute(
-                "PRAGMA table_info(results)"
-            ).fetchall()
-        }
+                    CREATE INDEX IF NOT EXISTS
+                    idx_tickets_user_status
+                    ON tickets(user_id, status);
 
-        if "points" not in columns:
-            self.conn.execute(
-                """
-                ALTER TABLE results
-                ADD COLUMN points INTEGER NOT NULL DEFAULT 0
-                """
-            )
+                    CREATE TABLE IF NOT EXISTS results (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        minecraft_username TEXT NOT NULL,
+                        gamemode TEXT NOT NULL,
+                        tier TEXT NOT NULL,
+                        tester_id BIGINT NOT NULL,
+                        points INTEGER NOT NULL DEFAULT 0,
+                        match_score TEXT NOT NULL DEFAULT 'N/A',
+                        verdict TEXT NOT NULL DEFAULT '',
+                        created_at TIMESTAMPTZ NOT NULL,
+                        corrected BOOLEAN NOT NULL DEFAULT FALSE
+                    );
 
-        if "match_score" not in columns:
-            self.conn.execute(
-                """
-                ALTER TABLE results
-                ADD COLUMN match_score TEXT NOT NULL DEFAULT 'N/A'
-                """
-            )
+                    CREATE INDEX IF NOT EXISTS
+                    idx_results_user
+                    ON results(user_id);
 
-        if "verdict" not in columns:
-            self.conn.execute(
-                """
-                ALTER TABLE results
-                ADD COLUMN verdict TEXT NOT NULL DEFAULT ''
-                """
-            )
+                    CREATE INDEX IF NOT EXISTS
+                    idx_results_gamemode
+                    ON results(gamemode);
 
-        if "corrected" not in columns:
-            self.conn.execute(
-                """
-                ALTER TABLE results
-                ADD COLUMN corrected INTEGER NOT NULL DEFAULT 0
-                """
-            )
+                    CREATE INDEX IF NOT EXISTS
+                    idx_results_points
+                    ON results(points DESC);
 
-        self.conn.commit()
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                    """
+                )
 
     # ======================================================
     # POINT HELPERS
@@ -160,21 +204,17 @@ class Database:
 
     @classmethod
     def points_for_tier(cls, tier):
-        """
-        Return the automatic point value for a tier.
-
-        Example:
-            LT5 -> 100
-            LT4 -> 400
-            HT1 -> 1500
-        """
 
         if not tier:
             return None
 
-        tier = str(tier).strip().upper()
+        tier = str(
+            tier
+        ).strip().upper()
 
-        return cls.TIER_POINTS.get(tier)
+        return cls.TIER_POINTS.get(
+            tier
+        )
 
     # ======================================================
     # QUEUES
@@ -190,65 +230,79 @@ class Database:
         limit=10
     ):
 
-        with self.transaction():
+        with self.transaction() as conn:
 
-            existing = self.conn.execute(
-                """
-                SELECT 1
-                FROM queues
-                WHERE user_id=?
-                """,
-                (user_id,)
-            ).fetchone()
+            with conn.cursor(
+                cursor_factory=RealDictCursor
+            ) as cursor:
 
-            if existing:
-                return False, "already_queued"
-
-            count = self.conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM queues
-                WHERE gamemode=?
-                """,
-                (gamemode,)
-            ).fetchone()[0]
-
-            if count >= limit:
-                return False, "full"
-
-            self.conn.execute(
-                """
-                INSERT INTO queues(
-                    user_id,
-                    gamemode,
-                    minecraft_username,
-                    preferred_server,
-                    joined_at
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM queues
+                    WHERE user_id=%s
+                    """,
+                    (user_id,)
                 )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    gamemode,
-                    minecraft_username,
-                    preferred_server,
-                    joined_at
+
+                if cursor.fetchone():
+                    return False, "already_queued"
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    AS count
+                    FROM queues
+                    WHERE gamemode=%s
+                    """,
+                    (gamemode,)
                 )
-            )
+
+                count = cursor.fetchone()["count"]
+
+                if count >= limit:
+                    return False, "full"
+
+                cursor.execute(
+                    """
+                    INSERT INTO queues(
+                        user_id,
+                        gamemode,
+                        minecraft_username,
+                        preferred_server,
+                        joined_at
+                    )
+                    VALUES(
+                        %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        user_id,
+                        gamemode,
+                        minecraft_username,
+                        preferred_server,
+                        joined_at
+                    )
+                )
 
         return True, "ok"
 
-    def queue_remove(self, user_id):
+    def queue_remove(
+        self,
+        user_id
+    ):
 
-        with self.transaction():
+        with self.transaction() as conn:
 
-            self.conn.execute(
-                """
-                DELETE FROM queues
-                WHERE user_id=?
-                """,
-                (user_id,)
-            )
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    DELETE FROM queues
+                    WHERE user_id=%s
+                    """,
+                    (user_id,)
+                )
 
     def queue_remove_mode_user(
         self,
@@ -256,74 +310,92 @@ class Database:
         user_id
     ):
 
-        with self.transaction():
+        with self.transaction() as conn:
 
-            self.conn.execute(
-                """
-                DELETE FROM queues
-                WHERE gamemode=?
-                AND user_id=?
-                """,
-                (
-                    gamemode,
-                    user_id
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    DELETE FROM queues
+                    WHERE gamemode=%s
+                    AND user_id=%s
+                    """,
+                    (
+                        gamemode,
+                        user_id
+                    )
                 )
-            )
 
-    def queues(self, gamemode=None):
+    def queues(
+        self,
+        gamemode=None
+    ):
 
         if gamemode:
 
-            return self.conn.execute(
+            return self.fetchall(
                 """
                 SELECT *
                 FROM queues
-                WHERE gamemode=?
+                WHERE gamemode=%s
                 ORDER BY joined_at ASC
                 """,
                 (gamemode,)
-            ).fetchall()
+            )
 
-        return self.conn.execute(
+        return self.fetchall(
             """
             SELECT *
             FROM queues
             ORDER BY joined_at ASC
             """
-        ).fetchall()
+        )
 
-    def count(self, gamemode):
+    def count(
+        self,
+        gamemode
+    ):
 
-        return self.conn.execute(
+        row = self.fetchone(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(*) AS count
             FROM queues
-            WHERE gamemode=?
+            WHERE gamemode=%s
             """,
             (gamemode,)
-        ).fetchone()[0]
+        )
+
+        return row["count"]
 
     # ======================================================
     # TICKETS
     # ======================================================
 
-    def active_ticket_for_user(self, user_id):
+    def active_ticket_for_user(
+        self,
+        user_id
+    ):
 
-        return self.conn.execute(
+        return self.fetchone(
             """
             SELECT *
             FROM tickets
-            WHERE user_id=?
+            WHERE user_id=%s
             AND status IN ('waiting', 'testing')
             ORDER BY created_at DESC
             LIMIT 1
             """,
             (user_id,)
-        ).fetchone()
+        )
 
-    def ticket_for_user(self, user_id):
+    def ticket_for_user(
+        self,
+        user_id
+    ):
 
-        return self.active_ticket_for_user(user_id)
+        return self.active_ticket_for_user(
+            user_id
+        )
 
     def create_ticket(
         self,
@@ -335,31 +407,36 @@ class Database:
         created_at
     ):
 
-        with self.transaction():
+        with self.transaction() as conn:
 
-            self.conn.execute(
-                """
-                INSERT INTO tickets(
-                    channel_id,
-                    user_id,
-                    gamemode,
-                    minecraft_username,
-                    preferred_server,
-                    tester_id,
-                    status,
-                    created_at
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    INSERT INTO tickets(
+                        channel_id,
+                        user_id,
+                        gamemode,
+                        minecraft_username,
+                        preferred_server,
+                        tester_id,
+                        status,
+                        created_at
+                    )
+                    VALUES(
+                        %s, %s, %s, %s, %s,
+                        NULL, 'waiting', %s
+                    )
+                    """,
+                    (
+                        channel_id,
+                        user_id,
+                        gamemode,
+                        minecraft_username,
+                        preferred_server,
+                        created_at
+                    )
                 )
-                VALUES (?, ?, ?, ?, ?, NULL, 'waiting', ?)
-                """,
-                (
-                    channel_id,
-                    user_id,
-                    gamemode,
-                    minecraft_username,
-                    preferred_server,
-                    created_at
-                )
-            )
 
     def claim_ticket(
         self,
@@ -368,37 +445,42 @@ class Database:
         claimed_at
     ):
 
-        with self.transaction():
+        with self.transaction() as conn:
 
-            cursor = self.conn.execute(
-                """
-                UPDATE tickets
-                SET
-                    tester_id=?,
-                    status='testing',
-                    claimed_at=?
-                WHERE channel_id=?
-                AND status='waiting'
-                """,
-                (
-                    tester_id,
-                    claimed_at,
-                    channel_id
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET
+                        tester_id=%s,
+                        status='testing',
+                        claimed_at=%s
+                    WHERE channel_id=%s
+                    AND status='waiting'
+                    """,
+                    (
+                        tester_id,
+                        claimed_at,
+                        channel_id
+                    )
                 )
-            )
 
-            return cursor.rowcount == 1
+                return cursor.rowcount == 1
 
-    def ticket(self, channel_id):
+    def ticket(
+        self,
+        channel_id
+    ):
 
-        return self.conn.execute(
+        return self.fetchone(
             """
             SELECT *
             FROM tickets
-            WHERE channel_id=?
+            WHERE channel_id=%s
             """,
             (channel_id,)
-        ).fetchone()
+        )
 
     def close_ticket(
         self,
@@ -406,22 +488,24 @@ class Database:
         closed_at
     ):
 
-        with self.transaction():
+        with self.transaction() as conn:
 
-            self.conn.execute(
-                """
-                UPDATE tickets
-                SET
-                    status='closed',
-                    closed_at=?
-                WHERE channel_id=?
-                AND status != 'closed'
-                """,
-                (
-                    closed_at,
-                    channel_id
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET
+                        status='closed',
+                        closed_at=%s
+                    WHERE channel_id=%s
+                    AND status != 'closed'
+                    """,
+                    (
+                        closed_at,
+                        channel_id
+                    )
                 )
-            )
 
     # ======================================================
     # RESULT SUBMISSION
@@ -441,80 +525,100 @@ class Database:
         created_at,
         closed_at
     ):
-        """
-        Atomically completes the ticket and creates the result.
 
-        Points are ALWAYS calculated from the tier here.
-        The supplied points argument is intentionally ignored.
-        """
+        tier = str(
+            tier
+        ).strip().upper()
 
-        tier = str(tier).strip().upper()
-
-        automatic_points = self.points_for_tier(tier)
+        automatic_points = (
+            self.points_for_tier(tier)
+        )
 
         if automatic_points is None:
             return False
 
-        with self.transaction():
+        with self.transaction() as conn:
 
-            ticket = self.conn.execute(
-                """
-                SELECT *
-                FROM tickets
-                WHERE channel_id=?
-                AND status='testing'
-                """,
-                (channel_id,)
-            ).fetchone()
+            with conn.cursor(
+                cursor_factory=RealDictCursor
+            ) as cursor:
 
-            if not ticket:
-                return False
+                # ------------------------------------------
+                # Lock ticket
+                # ------------------------------------------
 
-            cursor = self.conn.execute(
-                """
-                UPDATE tickets
-                SET
-                    status='closed',
-                    closed_at=?
-                WHERE channel_id=?
-                AND status='testing'
-                """,
-                (
-                    closed_at,
-                    channel_id
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM tickets
+                    WHERE channel_id=%s
+                    AND status='testing'
+                    FOR UPDATE
+                    """,
+                    (channel_id,)
                 )
-            )
 
-            if cursor.rowcount != 1:
-                return False
+                ticket = cursor.fetchone()
 
-            self.conn.execute(
-                """
-                INSERT INTO results(
-                    user_id,
-                    minecraft_username,
-                    gamemode,
-                    tier,
-                    tester_id,
-                    points,
-                    match_score,
-                    verdict,
-                    created_at
+                if not ticket:
+                    return False
+
+                # ------------------------------------------
+                # Close ticket
+                # ------------------------------------------
+
+                cursor.execute(
+                    """
+                    UPDATE tickets
+                    SET
+                        status='closed',
+                        closed_at=%s
+                    WHERE channel_id=%s
+                    AND status='testing'
+                    """,
+                    (
+                        closed_at,
+                        channel_id
+                    )
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    minecraft_username,
-                    gamemode,
-                    tier,
-                    tester_id,
-                    automatic_points,
-                    match_score,
-                    verdict,
-                    created_at
+
+                if cursor.rowcount != 1:
+                    return False
+
+                # ------------------------------------------
+                # Save result
+                # ------------------------------------------
+
+                cursor.execute(
+                    """
+                    INSERT INTO results(
+                        user_id,
+                        minecraft_username,
+                        gamemode,
+                        tier,
+                        tester_id,
+                        points,
+                        match_score,
+                        verdict,
+                        created_at
+                    )
+                    VALUES(
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        user_id,
+                        minecraft_username,
+                        gamemode,
+                        tier,
+                        tester_id,
+                        automatic_points,
+                        match_score,
+                        verdict,
+                        created_at
+                    )
                 )
-            )
 
         return True
 
@@ -524,25 +628,28 @@ class Database:
 
     def latest_results(self):
 
-        return self.conn.execute(
+        return self.fetchall(
             """
             SELECT *
             FROM results
             ORDER BY id DESC
             """
-        ).fetchall()
+        )
 
-    def results_for_user(self, user_id):
+    def results_for_user(
+        self,
+        user_id
+    ):
 
-        return self.conn.execute(
+        return self.fetchall(
             """
             SELECT *
             FROM results
-            WHERE user_id=?
+            WHERE user_id=%s
             ORDER BY id DESC
             """,
             (user_id,)
-        ).fetchall()
+        )
 
     # ======================================================
     # GLOBAL LEADERBOARD
@@ -550,77 +657,99 @@ class Database:
 
     def global_leaderboard(self):
 
-        return self.conn.execute(
+        return self.fetchall(
             """
             SELECT
                 user_id,
-                minecraft_username,
-                SUM(points) AS total_points,
+                MAX(minecraft_username)
+                    AS minecraft_username,
+                SUM(points)
+                    AS total_points,
                 COUNT(*) AS tests
             FROM results
-            GROUP BY user_id, minecraft_username
+            GROUP BY user_id
             ORDER BY
                 total_points DESC,
                 tests DESC,
                 minecraft_username ASC
             """
-        ).fetchall()
+        )
 
-    def global_rank_for_user(self, user_id):
+    def global_rank_for_user(
+        self,
+        user_id
+    ):
 
         rows = self.global_leaderboard()
 
-        for position, row in enumerate(rows, start=1):
+        for position, row in enumerate(
+            rows,
+            start=1
+        ):
 
             if row["user_id"] == user_id:
+
                 return {
                     "rank": position,
                     "user_id": row["user_id"],
-                    "minecraft_username": row["minecraft_username"],
-                    "total_points": row["total_points"],
-                    "tests": row["tests"]
+                    "minecraft_username":
+                        row["minecraft_username"],
+                    "total_points":
+                        row["total_points"],
+                    "tests":
+                        row["tests"]
                 }
 
         return None
 
-    def global_points_for_user(self, user_id):
+    def global_points_for_user(
+        self,
+        user_id
+    ):
 
-        result = self.conn.execute(
+        row = self.fetchone(
             """
             SELECT
-                COALESCE(SUM(points), 0)
-                AS total_points
+                COALESCE(
+                    SUM(points),
+                    0
+                ) AS total_points
             FROM results
-            WHERE user_id=?
+            WHERE user_id=%s
             """,
             (user_id,)
-        ).fetchone()
+        )
 
-        return result["total_points"]
+        return row["total_points"]
 
     # ======================================================
     # GAMEMODE LEADERBOARD
     # ======================================================
 
-    def gamemode_leaderboard(self, gamemode):
+    def gamemode_leaderboard(
+        self,
+        gamemode
+    ):
 
-        return self.conn.execute(
+        return self.fetchall(
             """
             SELECT
                 user_id,
-                minecraft_username,
-                SUM(points) AS total_points,
+                MAX(minecraft_username)
+                    AS minecraft_username,
+                SUM(points)
+                    AS total_points,
                 COUNT(*) AS tests
             FROM results
-            WHERE gamemode=?
-            GROUP BY user_id, minecraft_username
+            WHERE gamemode=%s
+            GROUP BY user_id
             ORDER BY
                 total_points DESC,
                 tests DESC,
                 minecraft_username ASC
             """,
             (gamemode,)
-        ).fetchall()
+        )
 
     # ======================================================
     # CORRECT RESULT
@@ -632,29 +761,128 @@ class Database:
         tier
     ):
 
-        tier = str(tier).strip().upper()
+        tier = str(
+            tier
+        ).strip().upper()
 
-        automatic_points = self.points_for_tier(tier)
+        automatic_points = (
+            self.points_for_tier(tier)
+        )
 
         if automatic_points is None:
             return False
 
-        with self.transaction():
+        with self.transaction() as conn:
 
-            cursor = self.conn.execute(
-                """
-                UPDATE results
-                SET
-                    tier=?,
-                    points=?,
-                    corrected=1
-                WHERE id=?
-                """,
-                (
-                    tier,
-                    automatic_points,
-                    result_id
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    UPDATE results
+                    SET
+                        tier=%s,
+                        points=%s,
+                        corrected=TRUE
+                    WHERE id=%s
+                    """,
+                    (
+                        tier,
+                        automatic_points,
+                        result_id
+                    )
                 )
-            )
 
-            return cursor.rowcount == 1
+                return cursor.rowcount == 1
+
+    # ======================================================
+    # SETTINGS
+    # ======================================================
+
+    def get_setting(
+        self,
+        key
+    ):
+
+        row = self.fetchone(
+            """
+            SELECT value
+            FROM settings
+            WHERE key=%s
+            """,
+            (key,)
+        )
+
+        if not row:
+            return None
+
+        return row["value"]
+
+    def set_setting(
+        self,
+        key,
+        value
+    ):
+
+        with self.transaction() as conn:
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    INSERT INTO settings(
+                        key,
+                        value
+                    )
+                    VALUES(%s, %s)
+                    ON CONFLICT(key)
+                    DO UPDATE SET
+                        value=EXCLUDED.value
+                    """,
+                    (
+                        key,
+                        str(value)
+                    )
+                )
+
+    # ======================================================
+    # MESSAGE IDs
+    # ======================================================
+
+    def get_message_id(
+        self,
+        key
+    ):
+
+        value = self.get_setting(key)
+
+        if value is None:
+            return None
+
+        try:
+            return int(value)
+
+        except (
+            ValueError,
+            TypeError
+        ):
+            return None
+
+    def save_message_id(
+        self,
+        key,
+        message_id
+    ):
+
+        self.set_setting(
+            key,
+            message_id
+        )
+
+    # ======================================================
+    # CLOSE
+    # ======================================================
+
+    def close(self):
+
+        if self.pool:
+            self.pool.closeall()
