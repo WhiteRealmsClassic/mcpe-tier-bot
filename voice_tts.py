@@ -5,6 +5,7 @@ import uuid
 
 import discord
 import edge_tts
+import imageio_ffmpeg
 
 
 class VoiceTTS:
@@ -24,25 +25,39 @@ class VoiceTTS:
         self.volume = volume
         self.pitch = pitch
 
-        # guild_id -> asyncio.Queue
         self.queues = {}
-
-        # guild_id -> worker task
         self.workers = {}
-
-        # guild_id -> currently connected VoiceClient
         self.connections = {}
+        self.connection_locks = {}
+
+        # imageio-ffmpeg provides FFmpeg automatically
+        self.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 
     # ==================================================
-    # GET QUEUE
+    # QUEUE
     # ==================================================
 
     def get_queue(self, guild_id):
 
         if guild_id not in self.queues:
-            self.queues[guild_id] = asyncio.Queue()
+
+            self.queues[guild_id] = asyncio.Queue(
+                maxsize=25
+            )
 
         return self.queues[guild_id]
+
+    # ==================================================
+    # CONNECTION LOCK
+    # ==================================================
+
+    def get_lock(self, guild_id):
+
+        if guild_id not in self.connection_locks:
+
+            self.connection_locks[guild_id] = asyncio.Lock()
+
+        return self.connection_locks[guild_id]
 
     # ==================================================
     # CONNECT
@@ -52,58 +67,97 @@ class VoiceTTS:
 
         guild_id = channel.guild.id
 
-        existing = self.connections.get(
-            guild_id
-        )
+        async with self.get_lock(guild_id):
 
-        if existing:
+            existing = self.connections.get(
+                guild_id
+            )
 
-            if existing.is_connected():
+            # Already connected through our tracker
+            if existing and existing.is_connected():
 
-                if existing.channel.id == channel.id:
+                if (
+                    existing.channel
+                    and existing.channel.id == channel.id
+                ):
+
                     return existing
 
                 try:
-                    await existing.move_to(channel)
+
+                    await existing.move_to(
+                        channel
+                    )
+
+                    print(
+                        f"[TTS] Moved to "
+                        f"#{channel.name} "
+                        f"in {channel.guild.name}"
+                    )
+
                     return existing
 
-                except discord.HTTPException:
-                    pass
+                except Exception as error:
 
-        voice_client = discord.utils.get(
-            self.bot.voice_clients,
-            guild=channel.guild
-        )
+                    print(
+                        f"[TTS] Failed to move: {error}"
+                    )
 
-        if voice_client:
+            # Look for an existing Discord voice client
+            voice_client = discord.utils.get(
+                self.bot.voice_clients,
+                guild=channel.guild
+            )
 
+            if voice_client:
+
+                try:
+
+                    if (
+                        not voice_client.channel
+                        or voice_client.channel.id != channel.id
+                    ):
+
+                        await voice_client.move_to(
+                            channel
+                        )
+
+                    self.connections[guild_id] = voice_client
+
+                    return voice_client
+
+                except Exception as error:
+
+                    print(
+                        f"[TTS] Existing voice client error: "
+                        f"{error}"
+                    )
+
+            # Connect from scratch
             try:
-                if voice_client.channel.id != channel.id:
-                    await voice_client.move_to(channel)
+
+                voice_client = await channel.connect(
+                    reconnect=True
+                )
 
                 self.connections[guild_id] = voice_client
 
+                print(
+                    f"[TTS] Joined "
+                    f"#{channel.name} "
+                    f"in {channel.guild.name}"
+                )
+
                 return voice_client
 
-            except discord.HTTPException:
-                pass
+            except Exception as error:
 
-        try:
+                print(
+                    f"[TTS] Failed to join "
+                    f"#{channel.name}: {error}"
+                )
 
-            voice_client = await channel.connect(
-                reconnect=True
-            )
-
-            self.connections[guild_id] = voice_client
-
-            return voice_client
-
-        except (
-            discord.ClientException,
-            discord.HTTPException
-        ):
-
-            return None
+                return None
 
     # ==================================================
     # DISCONNECT
@@ -118,21 +172,40 @@ class VoiceTTS:
 
         if not voice_client:
 
-            voice_client = discord.utils.get(
-                self.bot.voice_clients,
-                guild=self.bot.get_guild(guild_id)
+            guild = self.bot.get_guild(
+                guild_id
             )
+
+            if guild:
+
+                voice_client = discord.utils.get(
+                    self.bot.voice_clients,
+                    guild=guild
+                )
 
         if voice_client:
 
             try:
+
+                if voice_client.is_playing():
+                    voice_client.stop()
+
+            except Exception:
+                pass
+
+            try:
+
                 await voice_client.disconnect(
                     force=True
                 )
 
-            except discord.HTTPException:
-                pass
+            except Exception as error:
 
+                print(
+                    f"[TTS] Disconnect error: {error}"
+                )
+
+        # Clear queued messages
         queue = self.queues.get(
             guild_id
         )
@@ -142,10 +215,18 @@ class VoiceTTS:
             while not queue.empty():
 
                 try:
+
                     queue.get_nowait()
                     queue.task_done()
+
                 except asyncio.QueueEmpty:
+
                     break
+
+        print(
+            f"[TTS] Left voice channel "
+            f"in guild {guild_id}"
+        )
 
     # ==================================================
     # SPEAK
@@ -165,15 +246,26 @@ class VoiceTTS:
         if not text:
             return
 
-        # Discord messages can contain enormous amounts
-        # of text. Don't make TTS read a novel.
+        # Prevent enormous messages
         if len(text) > 500:
 
             text = text[:500] + "..."
 
-        await self.get_queue(
+        queue = self.get_queue(
             voice_channel.guild.id
-        ).put(
+        )
+
+        # Don't let spam create an infinite queue
+        if queue.full():
+
+            print(
+                f"[TTS] Queue full in "
+                f"{voice_channel.guild.name}"
+            )
+
+            return
+
+        await queue.put(
             (
                 voice_channel,
                 text
@@ -185,7 +277,7 @@ class VoiceTTS:
         )
 
     # ==================================================
-    # START WORKER
+    # WORKER START
     # ==================================================
 
     def start_worker(self, guild_id):
@@ -195,6 +287,7 @@ class VoiceTTS:
         )
 
         if worker and not worker.done():
+
             return
 
         self.workers[guild_id] = asyncio.create_task(
@@ -202,7 +295,7 @@ class VoiceTTS:
         )
 
     # ==================================================
-    # WORKER
+    # AUDIO WORKER
     # ==================================================
 
     async def worker(self, guild_id):
@@ -229,6 +322,8 @@ class VoiceTTS:
 
                 return
 
+            filename = None
+
             try:
 
                 voice_client = await self.connect(
@@ -236,6 +331,7 @@ class VoiceTTS:
                 )
 
                 if not voice_client:
+
                     continue
 
                 filename = os.path.join(
@@ -243,64 +339,94 @@ class VoiceTTS:
                     f"tierbot_tts_{uuid.uuid4().hex}.mp3"
                 )
 
-                try:
+                # Generate speech
+                await self.generate_audio(
+                    text,
+                    filename
+                )
 
-                    await self.generate_audio(
-                        text,
-                        filename
+                if not os.path.exists(filename):
+
+                    print(
+                        "[TTS] Audio file was not created."
                     )
 
-                    if not os.path.exists(filename):
-                        continue
+                    continue
 
-                    finished = asyncio.Event()
+                if not voice_client.is_connected():
 
-                    def after_play(error):
+                    continue
 
-                        if error:
-                            print(
-                                f"[TTS] Playback error: {error}"
-                            )
+                if voice_client.is_playing():
+
+                    voice_client.stop()
+
+                    await asyncio.sleep(
+                        0.1
+                    )
+
+                finished = asyncio.Event()
+
+                def after_play(error):
+
+                    if error:
+
+                        print(
+                            f"[TTS] Playback error: "
+                            f"{error}"
+                        )
+
+                    try:
 
                         self.bot.loop.call_soon_threadsafe(
                             finished.set
                         )
 
-                    audio = discord.FFmpegPCMAudio(
-                        filename,
-                        options=(
-                            "-vn "
-                            "-loglevel warning"
-                        )
-                    )
+                    except Exception:
 
-                    voice_client.play(
-                        audio,
-                        after=after_play
-                    )
-
-                    await finished.wait()
-
-                except Exception as error:
-
-                    print(
-                        f"[TTS] Error: {error}"
-                    )
-
-                finally:
-
-                    try:
-                        if os.path.exists(filename):
-                            os.remove(filename)
-                    except OSError:
                         pass
+
+                audio = discord.FFmpegPCMAudio(
+                    filename,
+                    executable=self.ffmpeg,
+                    options="-vn -loglevel warning"
+                )
+
+                voice_client.play(
+                    audio,
+                    after=after_play
+                )
+
+                await finished.wait()
+
+            except asyncio.CancelledError:
+
+                raise
+
+            except Exception as error:
+
+                print(
+                    f"[TTS] Worker error: {error}"
+                )
 
             finally:
 
                 queue.task_done()
 
+                if filename:
+
+                    try:
+
+                        if os.path.exists(filename):
+
+                            os.remove(filename)
+
+                    except OSError:
+
+                        pass
+
     # ==================================================
-    # GENERATE AUDIO
+    # EDGE TTS
     # ==================================================
 
     async def generate_audio(
@@ -309,7 +435,7 @@ class VoiceTTS:
         filename
     ):
 
-        communicate = edge_tts.Communicate(
+        communicator = edge_tts.Communicate(
             text,
             self.voice,
             rate=self.rate,
@@ -317,12 +443,12 @@ class VoiceTTS:
             pitch=self.pitch
         )
 
-        await communicate.save(
+        await communicator.save(
             filename
         )
 
     # ==================================================
-    # STOP WHEN EMPTY
+    # VOICE STATE
     # ==================================================
 
     async def handle_voice_update(
@@ -332,21 +458,19 @@ class VoiceTTS:
         after
     ):
 
-        guild = member.guild
+        # Ignore bots
+        if member.bot:
 
-        # Someone joined a VC.
+            return
+
+        # Someone joined/moved into a VC
         if after.channel:
 
-            # Don't react to the bot itself.
-            if member.bot:
-                return
-
-            # Automatically join the VC.
             await self.connect(
                 after.channel
             )
 
-        # Someone left/moved from a VC.
+        # Someone left/moved out of a VC
         if before.channel:
 
             channel = before.channel
@@ -357,19 +481,20 @@ class VoiceTTS:
                 if not m.bot
             ]
 
-            # Nobody is left.
+            # Last human left
             if not humans:
 
                 voice_client = self.connections.get(
-                    guild.id
+                    member.guild.id
                 )
 
                 if (
                     voice_client
                     and voice_client.channel
-                    and voice_client.channel.id == channel.id
+                    and voice_client.channel.id
+                    == channel.id
                 ):
 
                     await self.disconnect(
-                        guild.id
+                        member.guild.id
                     )
