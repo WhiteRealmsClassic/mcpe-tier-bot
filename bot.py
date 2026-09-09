@@ -7,6 +7,7 @@ from discord.ext import commands
 
 from config import *
 from database import Database
+from voice_tts import VoiceTTS
 
 
 # ======================================================
@@ -30,6 +31,7 @@ def bar(n):
 def add_server_logo(embed):
 
     if SERVER_LOGO_URL:
+
         embed.set_thumbnail(
             url=SERVER_LOGO_URL
         )
@@ -45,18 +47,47 @@ class TierBot(commands.Bot):
 
     def __init__(self):
 
+        # ==================================================
+        # INTENTS
+        # ==================================================
+
         intents = discord.Intents.default()
+
         intents.guilds = True
         intents.members = True
+
+        # TTS requires voice state events
+        intents.voice_states = True
+
+        # TTS requires reading Voice Channel Text Chat
+        intents.message_content = True
 
         super().__init__(
             command_prefix="!",
             intents=intents
         )
 
-        self.db = Database(DB_PATH)
+        # ==================================================
+        # DATABASE
+        # ==================================================
+
+        self.db = Database(
+            DB_PATH
+        )
 
         self.refresh_lock = asyncio.Lock()
+
+        # ==================================================
+        # TTS
+        # ==================================================
+
+        self.tts = VoiceTTS(
+            self,
+            voice=TTS_VOICE,
+            rate=TTS_RATE,
+            volume=TTS_VOLUME,
+            pitch=TTS_PITCH
+        )
 
     # ==================================================
     # SETUP
@@ -116,9 +147,158 @@ class TierBot(commands.Bot):
             f"{self.db.integrity_check()}"
         )
 
+        print(
+            f"TTS enabled: {TTS_ENABLED}"
+        )
+
+        print(
+            f"TTS voice: {TTS_VOICE}"
+        )
+
         await self.refresh_apply_message()
         await self.refresh_queue_message()
         await self.refresh_leaderboard()
+
+    # ==================================================
+    # TTS VOICE STATE
+    # ==================================================
+
+    async def on_voice_state_update(
+        self,
+        member,
+        before,
+        after
+    ):
+
+        if not TTS_ENABLED:
+            return
+
+        # Only use TTS in the configured server
+        if member.guild.id != GUILD_ID:
+            return
+
+        await self.tts.handle_voice_update(
+            member,
+            before,
+            after
+        )
+
+    # ==================================================
+    # TTS MESSAGE READER
+    # ==================================================
+
+    async def on_message(
+        self,
+        message
+    ):
+
+        # --------------------------------------------------
+        # BOT MESSAGE
+        # --------------------------------------------------
+
+        if message.author.bot:
+
+            await self.process_commands(
+                message
+            )
+
+            return
+
+        # --------------------------------------------------
+        # TTS DISABLED
+        # --------------------------------------------------
+
+        if not TTS_ENABLED:
+
+            await self.process_commands(
+                message
+            )
+
+            return
+
+        # --------------------------------------------------
+        # DM
+        # --------------------------------------------------
+
+        if not message.guild:
+
+            await self.process_commands(
+                message
+            )
+
+            return
+
+        # --------------------------------------------------
+        # ONLY CONFIGURED SERVER
+        # --------------------------------------------------
+
+        if message.guild.id != GUILD_ID:
+
+            await self.process_commands(
+                message
+            )
+
+            return
+
+        # --------------------------------------------------
+        # GET ACTIVE VOICE CONNECTION
+        # --------------------------------------------------
+
+        voice_client = discord.utils.get(
+            self.voice_clients,
+            guild=message.guild
+        )
+
+        if voice_client and voice_client.is_connected():
+
+            # --------------------------------------------------
+            # IMPORTANT
+            #
+            # Voice Channel Text Chat uses the same channel ID
+            # as the voice channel.
+            #
+            # We compare IDs rather than relying on
+            # isinstance(message.channel, discord.VoiceChannel)
+            # so this works across discord.py versions.
+            # --------------------------------------------------
+
+            if (
+                voice_client.channel
+                and message.channel.id
+                == voice_client.channel.id
+            ):
+
+                text = message.clean_content.strip()
+
+                if text:
+
+                    # Don't read prefix commands aloud
+                    if not text.startswith("!"):
+
+                        if len(text) > 500:
+
+                            text = (
+                                text[:500]
+                                + "..."
+                            )
+
+                        spoken_text = (
+                            f"{message.author.display_name} "
+                            f"says, {text}"
+                        )
+
+                        await self.tts.speak(
+                            voice_client.channel,
+                            spoken_text
+                        )
+
+        # --------------------------------------------------
+        # KEEP PREFIX COMMANDS WORKING
+        # --------------------------------------------------
+
+        await self.process_commands(
+            message
+        )
 
     # ==================================================
     # STAFF
@@ -130,6 +310,7 @@ class TierBot(commands.Bot):
             member,
             discord.Member
         ):
+
             return False
 
         return (
@@ -517,7 +698,9 @@ class TierBot(commands.Bot):
 
         embed.add_field(
             name="Global Rankings",
-            value="\n".join(lines),
+            value="\n".join(
+                lines
+            ),
             inline=False
         )
 
@@ -587,7 +770,9 @@ class TierBot(commands.Bot):
 
             embed.add_field(
                 name="Rankings",
-                value="\n".join(lines),
+                value="\n".join(
+                    lines
+                ),
                 inline=False
             )
 
@@ -699,11 +884,13 @@ class TierBot(commands.Bot):
         if channel:
 
             try:
+
                 await channel.send(
                     text
                 )
 
             except discord.HTTPException:
+
                 pass
 
 
@@ -1062,10 +1249,13 @@ class QueueModal(
             if channel:
 
                 try:
+
                     await channel.delete(
                         reason="Ticket creation failed"
                     )
+
                 except discord.HTTPException:
+
                     pass
 
             raise
@@ -1501,6 +1691,7 @@ class ResultModal(
                 )
 
             except discord.HTTPException:
+
                 pass
 
         await interaction.response.send_message(
@@ -1533,6 +1724,7 @@ class ResultModal(
             )
 
         except discord.HTTPException:
+
             pass
 
 
@@ -1627,6 +1819,7 @@ class QueueView(discord.ui.View):
                     )
 
                 except discord.HTTPException:
+
                     pass
 
         await interaction.response.send_message(
@@ -1738,6 +1931,7 @@ async def assign_tier_role(
                 )
 
             except discord.HTTPException:
+
                 pass
 
     role = roles.get(
@@ -1757,6 +1951,7 @@ async def assign_tier_role(
             )
 
         except discord.HTTPException:
+
             pass
 
 
@@ -1842,8 +2037,11 @@ async def stats(
     )
 
     if rank is None:
+
         rank_text = "Unranked"
+
     else:
+
         rank_text = f"#{rank}"
 
     embed = discord.Embed(
@@ -1893,6 +2091,7 @@ async def stats(
         if result:
 
             tier = result["tier"]
+
             points = int(
                 result["points"] or 0
             )
@@ -2035,6 +2234,7 @@ async def force_remove(
                 )
 
             except discord.HTTPException:
+
                 pass
 
     await bot.refresh_queue_message()
@@ -2092,7 +2292,9 @@ async def player_results(
                 ).timestamp()
             )
 
-            time_text = f"<t:{timestamp}:R>"
+            time_text = (
+                f"<t:{timestamp}:R>"
+            )
 
         except Exception:
 
@@ -2181,6 +2383,7 @@ async def close_ticket(
         )
 
     except discord.HTTPException:
+
         pass
 
 
@@ -2193,4 +2396,3 @@ if __name__ == "__main__":
     bot.run(
         TOKEN
     )
-
