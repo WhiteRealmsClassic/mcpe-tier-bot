@@ -23,8 +23,11 @@ def emoji(gm):
 
 
 def bar(n):
-    n = max(0, min(5, n))
-    return "■" * n + "□" * (5 - n)
+    """
+    15-slot queue progress bar.
+    """
+    n = max(0, min(15, n))
+    return "■" * n + "□" * (15 - n)
 
 
 def add_server_logo(embed):
@@ -362,7 +365,7 @@ class TierBot(commands.Bot):
                     f"{data[0]}"
                 ),
                 value=(
-                    f"**{count}/5**\n"
+                    f"**{count}/15**\n"
                     f"`{bar(count)}`"
                 ),
                 inline=False
@@ -470,7 +473,7 @@ class TierBot(commands.Bot):
                 return
 
     # ==================================================
-    # GLOBAL LEADERBOARD EMBED
+    # GLOBAL LEADERBOARD
     # ==================================================
 
     def global_leaderboard_embed(self):
@@ -543,7 +546,7 @@ class TierBot(commands.Bot):
         )
 
     # ==================================================
-    # GAMEMODE LEADERBOARD EMBED
+    # GAMEMODE LEADERBOARD
     # ==================================================
 
     def leaderboard_embed(
@@ -730,7 +733,7 @@ class TierBot(commands.Bot):
         )
 
     # ==================================================
-    # AUDIT
+    # AUDIT LOG
     # ==================================================
 
     async def log(self, text):
@@ -868,10 +871,10 @@ class GamemodeView(discord.ui.View):
 
         gm = self.select.values[0]
 
-        if self.bot.db.count(gm) >= 5:
+        if self.bot.db.count(gm) >= 15:
 
             return await interaction.response.send_message(
-                "That queue is full (5/5).",
+                "That queue is full (15/15).",
                 ephemeral=True
             )
 
@@ -939,13 +942,17 @@ class QueueModal(
                 ephemeral=True
             )
 
+        # ==================================================
+        # JOIN 15-PLAYER QUEUE
+        # ==================================================
+
         ok, reason = self.bot.db.queue_join(
             interaction.user.id,
             self.gm,
             minecraft_username,
             preferred_server,
             now(),
-            5
+            15
         )
 
         if not ok:
@@ -960,7 +967,7 @@ class QueueModal(
             if reason == "full":
 
                 return await interaction.response.send_message(
-                    "That queue is full (5/5).",
+                    "That queue is full (15/15).",
                     ephemeral=True
                 )
 
