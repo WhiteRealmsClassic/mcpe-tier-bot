@@ -1,4 +1,3 @@
-```python
 import os
 import sqlite3
 import shutil
@@ -1191,4 +1190,4 @@ class Database:
             )
 
         return True
-```
+
