@@ -1,4 +1,3 @@
-```python
 import asyncio
 from datetime import datetime, timezone
 
@@ -2194,4 +2193,4 @@ if __name__ == "__main__":
     bot.run(
         TOKEN
     )
-```
+
