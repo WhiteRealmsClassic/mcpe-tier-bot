@@ -224,8 +224,6 @@ class TierBot(commands.Bot):
         if channel is not None:
             return ticket
 
-        # Discord channel no longer exists.
-        # Remove stale database state.
         self.db.close_ticket(
             ticket["channel_id"],
             now()
@@ -297,12 +295,16 @@ class TierBot(commands.Bot):
                     message_id
                 )
 
+            except discord.NotFound:
+
+                message = None
+
             except (
-                discord.NotFound,
+                discord.Forbidden,
                 discord.HTTPException
             ):
 
-                message = None
+                return
 
         if not message:
 
@@ -313,11 +315,20 @@ class TierBot(commands.Bot):
 
         else:
 
-            await message.edit(
-                content=None,
-                embed=self.apply_embed(),
-                view=ApplyView(self)
-            )
+            try:
+
+                await message.edit(
+                    content=None,
+                    embed=self.apply_embed(),
+                    view=ApplyView(self)
+                )
+
+            except (
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+
+                return
 
         self.save_message_id(
             "apply_message_id",
@@ -384,31 +395,84 @@ class TierBot(commands.Bot):
                 "queue_message_id"
             )
 
-            message = None
+            # ==========================================
+            # NO SAVED MESSAGE
+            # ==========================================
 
-            if message_id:
+            if not message_id:
 
                 try:
 
-                    message = await channel.fetch_message(
-                        message_id
+                    message = await channel.send(
+                        embed=self.queue_embed(),
+                        view=QueueView(self)
                     )
 
                 except (
-                    discord.NotFound,
+                    discord.Forbidden,
                     discord.HTTPException
                 ):
 
-                    message = None
+                    return
 
-            if not message:
-
-                message = await channel.send(
-                    embed=self.queue_embed(),
-                    view=QueueView(self)
+                self.save_message_id(
+                    "queue_message_id",
+                    message.id
                 )
 
-            else:
+                return
+
+            # ==========================================
+            # FETCH EXISTING MESSAGE
+            # ==========================================
+
+            try:
+
+                message = await channel.fetch_message(
+                    message_id
+                )
+
+            except discord.NotFound:
+
+                # The saved message was actually deleted.
+                # Only NOW do we create a replacement.
+
+                try:
+
+                    message = await channel.send(
+                        embed=self.queue_embed(),
+                        view=QueueView(self)
+                    )
+
+                except (
+                    discord.Forbidden,
+                    discord.HTTPException
+                ):
+
+                    return
+
+                self.save_message_id(
+                    "queue_message_id",
+                    message.id
+                )
+
+                return
+
+            except (
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+
+                # Do NOT create a new message.
+                # A temporary Discord/API error should
+                # never cause duplicate queue panels.
+                return
+
+            # ==========================================
+            # EDIT EXISTING MESSAGE
+            # ==========================================
+
+            try:
 
                 await message.edit(
                     content=None,
@@ -416,10 +480,12 @@ class TierBot(commands.Bot):
                     view=QueueView(self)
                 )
 
-            self.save_message_id(
-                "queue_message_id",
-                message.id
-            )
+            except (
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+
+                return
 
     # ==================================================
     # LEADERBOARD EMBED
@@ -438,8 +504,6 @@ class TierBot(commands.Bot):
 
         rows = self.db.latest_results()
 
-        # Keep only the best score for each player
-        # in this gamemode.
         players = {}
 
         for row in rows:
@@ -552,12 +616,16 @@ class TierBot(commands.Bot):
                     message_id
                 )
 
+            except discord.NotFound:
+
+                message = None
+
             except (
-                discord.NotFound,
+                discord.Forbidden,
                 discord.HTTPException
             ):
 
-                message = None
+                return
 
         if not message:
 
@@ -568,11 +636,20 @@ class TierBot(commands.Bot):
 
         else:
 
-            await message.edit(
-                content=None,
-                embed=self.leaderboard_embed(),
-                view=LeaderboardView(self)
-            )
+            try:
+
+                await message.edit(
+                    content=None,
+                    embed=self.leaderboard_embed(),
+                    view=LeaderboardView(self)
+                )
+
+            except (
+                discord.Forbidden,
+                discord.HTTPException
+            ):
+
+                return
 
         self.save_message_id(
             "leaderboard_message_id",
@@ -1043,8 +1120,6 @@ class TicketView(discord.ui.View):
             f"Test claimed by {interaction.user.mention}."
         )
 
-        # Send the result button instead of immediately
-        # asking for a rank.
         embed = discord.Embed(
             title="Test In Progress",
             description=(
@@ -1122,7 +1197,6 @@ class ResultView(discord.ui.View):
                 ephemeral=True
             )
 
-        # Only the tester who claimed the ticket can submit it.
         if ticket["tester_id"] != interaction.user.id:
 
             return await interaction.response.send_message(
@@ -1198,20 +1272,12 @@ class ResultModal(
             self.verdict.value.strip()
         )
 
-        # ----------------------------------------------
-        # Validate rank
-        # ----------------------------------------------
-
         if tier not in TIERS:
 
             return await interaction.response.send_message(
                 "Invalid rank. Use a rank such as HT1, MT2, LT3, etc.",
                 ephemeral=True
             )
-
-        # ----------------------------------------------
-        # Validate points
-        # ----------------------------------------------
 
         try:
 
@@ -1232,10 +1298,6 @@ class ResultModal(
                 "Points cannot be negative.",
                 ephemeral=True
             )
-
-        # ----------------------------------------------
-        # Re-check ticket before finalizing
-        # ----------------------------------------------
 
         ticket = self.bot.db.ticket(
             interaction.channel.id
@@ -1262,10 +1324,6 @@ class ResultModal(
                 ephemeral=True
             )
 
-        # ----------------------------------------------
-        # ATOMIC RESULT SUBMISSION
-        # ----------------------------------------------
-
         saved = self.bot.db.finalize_test(
             channel_id=interaction.channel.id,
             user_id=ticket["user_id"],
@@ -1287,14 +1345,9 @@ class ResultModal(
                 ephemeral=True
             )
 
-        # Queue is no longer active.
         self.bot.db.queue_remove(
             ticket["user_id"]
         )
-
-        # ----------------------------------------------
-        # RESULTS CHANNEL
-        # ----------------------------------------------
 
         results = self.bot.get_channel(
             RESULTS_CHANNEL_ID
@@ -1368,10 +1421,6 @@ class ResultModal(
                 embed=embed
             )
 
-        # ----------------------------------------------
-        # TIER ROLE
-        # ----------------------------------------------
-
         member = interaction.guild.get_member(
             ticket["user_id"]
         )
@@ -1396,10 +1445,6 @@ class ResultModal(
 
             except discord.HTTPException:
                 pass
-
-        # ----------------------------------------------
-        # CURRENT TICKET
-        # ----------------------------------------------
 
         await interaction.response.send_message(
             f"Result submitted successfully: **{tier}** • **{points}pts**.\n"
@@ -1513,6 +1558,7 @@ class QueueView(discord.ui.View):
                 discord.Forbidden,
                 discord.HTTPException
             ):
+
                 ticket_channel = None
 
             self.bot.db.close_ticket(
@@ -1740,6 +1786,7 @@ async def force_remove(
             discord.Forbidden,
             discord.HTTPException
         ):
+
             channel = None
 
         if channel:
