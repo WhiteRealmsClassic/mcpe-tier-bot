@@ -1,3 +1,4 @@
+```python
 import asyncio
 from datetime import datetime, timezone
 
@@ -149,27 +150,22 @@ class TierBot(commands.Bot):
 
     def get_message_id(self, key):
 
-        row = self.db.conn.execute(
-            """
-            SELECT value
-            FROM settings
-            WHERE key=?
-            """,
-            (key,)
-        ).fetchone()
+        value = self.db.get_setting(
+            key
+        )
 
-        if not row:
+        if not value:
             return None
 
         try:
-            return int(
-                row["value"]
-            )
+
+            return int(value)
 
         except (
             ValueError,
             TypeError
         ):
+
             return None
 
     def save_message_id(
@@ -178,21 +174,10 @@ class TierBot(commands.Bot):
         message_id
     ):
 
-        self.db.conn.execute(
-            """
-            INSERT OR REPLACE INTO settings(
-                key,
-                value
-            )
-            VALUES(?, ?)
-            """,
-            (
-                key,
-                str(message_id)
-            )
+        self.db.save_setting(
+            key,
+            message_id
         )
-
-        self.db.conn.commit()
 
     # ==================================================
     # REAL ACTIVE TICKET
@@ -1393,7 +1378,6 @@ class ResultModal(
                 ephemeral=True
             )
 
-        # Database calculates the actual points.
         saved = self.bot.db.finalize_test(
             channel_id=interaction.channel.id,
             user_id=ticket["user_id"],
@@ -1422,10 +1406,6 @@ class ResultModal(
         self.bot.db.queue_remove(
             ticket["user_id"]
         )
-
-        # ==================================================
-        # RESULTS CHANNEL
-        # ==================================================
 
         results = self.bot.get_channel(
             RESULTS_CHANNEL_ID
@@ -1498,10 +1478,6 @@ class ResultModal(
             await results.send(
                 embed=embed
             )
-
-        # ==================================================
-        # TIER ROLE + DM
-        # ==================================================
 
         member = interaction.guild.get_member(
             ticket["user_id"]
@@ -1828,6 +1804,173 @@ async def setup(
 
 
 # ======================================================
+# STATS
+# ======================================================
+
+@bot.tree.command(
+    name="stats",
+    description="Show a player's MCPE profile"
+)
+@app_commands.describe(
+    username="Discord member whose MCPE profile you want to view"
+)
+async def stats(
+    interaction: discord.Interaction,
+    username: discord.Member
+):
+
+    player = bot.db.stats_player(
+        username.id
+    )
+
+    if not player:
+
+        return await interaction.response.send_message(
+            "This player has no MCPE tier profile yet.",
+            ephemeral=True
+        )
+
+    gamemode_results = bot.db.stats_gamemodes(
+        username.id
+    )
+
+    total_points = int(
+        player["total_points"] or 0
+    )
+
+    rank = bot.db.global_rank(
+        username.id
+    )
+
+    if rank is None:
+        rank_text = "Unranked"
+    else:
+        rank_text = f"#{rank}"
+
+    embed = discord.Embed(
+        title=f"{player['minecraft_username']}'s Profile",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="IGN",
+        value=player["minecraft_username"],
+        inline=True
+    )
+
+    embed.add_field(
+        name="Region",
+        value=player["region"] or "No Region",
+        inline=True
+    )
+
+    embed.add_field(
+        name="Total Points",
+        value=f"{total_points}",
+        inline=True
+    )
+
+    embed.add_field(
+        name="Global Rank",
+        value=rank_text,
+        inline=True
+    )
+
+    # ==================================================
+    # GAMEMODES
+    # ==================================================
+
+    gamemode_lines = []
+
+    main_gamemode = None
+    main_points = -1
+
+    for gm, data in GAMEMODES.items():
+
+        result = gamemode_results.get(
+            gm
+        )
+
+        if result:
+
+            tier = result["tier"]
+            points = int(
+                result["points"] or 0
+            )
+
+            line = (
+                f"{emoji(gm)} "
+                f"**{data[0]}** - "
+                f"[{tier}] ({points}pts)"
+            )
+
+            if points > main_points:
+
+                main_points = points
+                main_gamemode = gm
+
+        else:
+
+            line = (
+                f"{emoji(gm)} "
+                f"**{data[0]}** - "
+                f"Unranked (0pts)"
+            )
+
+        gamemode_lines.append(
+            line
+        )
+
+    embed.add_field(
+        name="Gamemodes",
+        value="\n".join(
+            gamemode_lines
+        ),
+        inline=False
+    )
+
+    if main_gamemode:
+
+        main_name = GAMEMODES[
+            main_gamemode
+        ][0]
+
+    else:
+
+        main_name = "None"
+
+    embed.add_field(
+        name="Main Gamemode",
+        value=main_name,
+        inline=False
+    )
+
+    # ==================================================
+    # AVATAR
+    # ==================================================
+
+    avatar = username.display_avatar.url
+
+    embed.set_image(
+        url=avatar
+    )
+
+    embed.set_footer(
+        text=(
+            f"{rank_text} on Global Leaderboard"
+        )
+    )
+
+    add_server_logo(
+        embed
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ======================================================
 # FORCE REMOVE
 # ======================================================
 
@@ -2051,3 +2194,4 @@ if __name__ == "__main__":
     bot.run(
         TOKEN
     )
+```
