@@ -1,13 +1,12 @@
+```python
 import os
 import sqlite3
+import shutil
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 
 class Database:
-
-    # ======================================================
-    # TIER POINTS
-    # ======================================================
 
     TIER_POINTS = {
         "LT5": 100,
@@ -31,79 +30,81 @@ class Database:
         "HT1": 1500,
     }
 
-    VALID_STATUSES = {
-        "waiting",
-        "testing",
-        "closed",
-        "cancelled",
-    }
-
-    # ======================================================
-    # INIT
-    # ======================================================
-
     def __init__(self, path):
 
         self.path = path
 
-        folder = os.path.dirname(path)
+        directory = os.path.dirname(
+            os.path.abspath(path)
+        )
 
-        if folder:
-            os.makedirs(folder, exist_ok=True)
+        os.makedirs(
+            directory,
+            exist_ok=True
+        )
 
         self.conn = sqlite3.connect(
-            self.path,
-            check_same_thread=False,
-            timeout=30
+            path,
+            check_same_thread=False
         )
 
         self.conn.row_factory = sqlite3.Row
 
-        # SQLite reliability/performance.
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=30000")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute(
+            "PRAGMA journal_mode=WAL"
+        )
+
+        self.conn.execute(
+            "PRAGMA synchronous=NORMAL"
+        )
+
+        self.conn.execute(
+            "PRAGMA foreign_keys=ON"
+        )
+
+        self.conn.execute(
+            "PRAGMA busy_timeout=10000"
+        )
 
         self.setup()
 
-    # ======================================================
+    # ==================================================
     # TRANSACTION
-    # ======================================================
+    # ==================================================
 
     @contextmanager
     def transaction(self):
 
-        self.conn.execute("BEGIN IMMEDIATE")
-
         try:
-            yield
+
+            self.conn.execute(
+                "BEGIN IMMEDIATE"
+            )
+
+            yield self.conn
+
             self.conn.commit()
 
         except Exception:
+
             self.conn.rollback()
             raise
 
-    # ======================================================
-    # SETUP / MIGRATIONS
-    # ======================================================
+    # ==================================================
+    # SETUP
+    # ==================================================
 
     def setup(self):
 
         self.conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS schema_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS players (
                 user_id INTEGER PRIMARY KEY,
                 minecraft_username TEXT NOT NULL,
+                region TEXT NOT NULL DEFAULT 'No Region',
                 current_tier TEXT,
-                current_points INTEGER NOT NULL DEFAULT 0,
+                total_points INTEGER NOT NULL DEFAULT 0,
                 total_tests INTEGER NOT NULL DEFAULT 0,
-                first_seen_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
 
@@ -121,364 +122,285 @@ class Database:
                 gamemode TEXT NOT NULL,
                 minecraft_username TEXT NOT NULL,
                 preferred_server TEXT NOT NULL,
-
                 tester_id INTEGER,
-
                 status TEXT NOT NULL DEFAULT 'waiting',
-
                 created_at TEXT NOT NULL,
                 claimed_at TEXT,
                 closed_at TEXT,
-
                 close_reason TEXT
             );
 
             CREATE TABLE IF NOT EXISTS results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                 user_id INTEGER NOT NULL,
                 minecraft_username TEXT NOT NULL,
-
                 gamemode TEXT NOT NULL,
-
                 tier TEXT NOT NULL,
                 tester_id INTEGER NOT NULL,
-
-                points INTEGER NOT NULL DEFAULT 0,
-
-                match_score TEXT NOT NULL DEFAULT 'N/A',
-                verdict TEXT NOT NULL DEFAULT '',
-
+                points INTEGER NOT NULL,
+                match_score TEXT,
+                verdict TEXT,
                 created_at TEXT NOT NULL,
-
                 corrected INTEGER NOT NULL DEFAULT 0,
                 corrected_at TEXT,
-                corrected_by INTEGER,
-
-                original_tier TEXT,
-                original_points INTEGER
+                corrected_by INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
+                value TEXT NOT NULL,
+                updated_at TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_queue_gamemode
-                ON queues(gamemode);
-
-            CREATE INDEX IF NOT EXISTS idx_queue_joined
-                ON queues(joined_at);
-
-            CREATE INDEX IF NOT EXISTS idx_ticket_user
-                ON tickets(user_id);
-
-            CREATE INDEX IF NOT EXISTS idx_ticket_status
-                ON tickets(status);
-
-            CREATE INDEX IF NOT EXISTS idx_ticket_tester
-                ON tickets(tester_id);
-
             CREATE INDEX IF NOT EXISTS idx_results_user
-                ON results(user_id);
+            ON results(user_id);
 
             CREATE INDEX IF NOT EXISTS idx_results_gamemode
-                ON results(gamemode);
+            ON results(gamemode);
 
-            CREATE INDEX IF NOT EXISTS idx_results_tier
-                ON results(tier);
-
-            CREATE INDEX IF NOT EXISTS idx_results_created
-                ON results(created_at);
+            CREATE INDEX IF NOT EXISTS idx_results_user_gamemode
+            ON results(user_id, gamemode);
 
             CREATE INDEX IF NOT EXISTS idx_results_points
-                ON results(points);
+            ON results(points DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_tickets_user
+            ON tickets(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_tickets_status
+            ON tickets(status);
+
+            CREATE INDEX IF NOT EXISTS idx_queues_gamemode
+            ON queues(gamemode);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_active_ticket_user
+            ON tickets(user_id)
+            WHERE status IN ('waiting', 'testing');
             """
         )
 
-        self._migrate_old_results()
-
-        self._rebuild_player_cache()
+        self._migrate()
 
         self.conn.commit()
 
-    # ======================================================
-    # MIGRATION
-    # ======================================================
+    # ==================================================
+    # MIGRATIONS
+    # ==================================================
 
-    def _migrate_old_results(self):
+    def _column_exists(self, table, column):
 
-        columns = {
-            row["name"]
-            for row in self.conn.execute(
-                "PRAGMA table_info(results)"
-            ).fetchall()
-        }
-
-        migrations = {
-
-            "points": """
-                ALTER TABLE results
-                ADD COLUMN points INTEGER NOT NULL DEFAULT 0
-            """,
-
-            "match_score": """
-                ALTER TABLE results
-                ADD COLUMN match_score TEXT NOT NULL DEFAULT 'N/A'
-            """,
-
-            "verdict": """
-                ALTER TABLE results
-                ADD COLUMN verdict TEXT NOT NULL DEFAULT ''
-            """,
-
-            "corrected": """
-                ALTER TABLE results
-                ADD COLUMN corrected INTEGER NOT NULL DEFAULT 0
-            """,
-
-            "corrected_at": """
-                ALTER TABLE results
-                ADD COLUMN corrected_at TEXT
-            """,
-
-            "corrected_by": """
-                ALTER TABLE results
-                ADD COLUMN corrected_by INTEGER
-            """,
-
-            "original_tier": """
-                ALTER TABLE results
-                ADD COLUMN original_tier TEXT
-            """,
-
-            "original_points": """
-                ALTER TABLE results
-                ADD COLUMN original_points INTEGER
-            """
-        }
-
-        for column, sql in migrations.items():
-
-            if column not in columns:
-
-                self.conn.execute(sql)
-
-        # Repair old results whose point value may be wrong.
         rows = self.conn.execute(
-            """
-            SELECT id, tier, points
-            FROM results
-            """
+            f"PRAGMA table_info({table})"
         ).fetchall()
 
-        for row in rows:
-
-            tier = self.normalize_tier(row["tier"])
-
-            points = self.points_for_tier(tier)
-
-            if points is None:
-                continue
-
-            if row["points"] != points:
-
-                self.conn.execute(
-                    """
-                    UPDATE results
-                    SET
-                        tier=?,
-                        points=?
-                    WHERE id=?
-                    """,
-                    (
-                        tier,
-                        points,
-                        row["id"]
-                    )
-                )
-
-    # ======================================================
-    # PLAYER CACHE
-    # ======================================================
-
-    def _rebuild_player_cache(self):
-
-        self.conn.execute(
-            "DELETE FROM players"
+        return any(
+            row["name"] == column
+            for row in rows
         )
 
-        users = self.conn.execute(
+    def _migrate(self):
+
+        migrations = [
+            (
+                "players",
+                "region",
+                "ALTER TABLE players ADD COLUMN region TEXT NOT NULL DEFAULT 'No Region'"
+            ),
+            (
+                "players",
+                "current_tier",
+                "ALTER TABLE players ADD COLUMN current_tier TEXT"
+            ),
+            (
+                "players",
+                "total_points",
+                "ALTER TABLE players ADD COLUMN total_points INTEGER NOT NULL DEFAULT 0"
+            ),
+            (
+                "players",
+                "total_tests",
+                "ALTER TABLE players ADD COLUMN total_tests INTEGER NOT NULL DEFAULT 0"
+            ),
+            (
+                "players",
+                "updated_at",
+                "ALTER TABLE players ADD COLUMN updated_at TEXT"
+            ),
+            (
+                "tickets",
+                "close_reason",
+                "ALTER TABLE tickets ADD COLUMN close_reason TEXT"
+            ),
+            (
+                "results",
+                "corrected_at",
+                "ALTER TABLE results ADD COLUMN corrected_at TEXT"
+            ),
+            (
+                "results",
+                "corrected_by",
+                "ALTER TABLE results ADD COLUMN corrected_by INTEGER"
+            ),
+        ]
+
+        for table, column, sql in migrations:
+
+            if not self._column_exists(
+                table,
+                column
+            ):
+
+                try:
+                    self.conn.execute(sql)
+                except sqlite3.OperationalError:
+                    pass
+
+    # ==================================================
+    # INTEGRITY
+    # ==================================================
+
+    def integrity_check(self):
+
+        try:
+
+            row = self.conn.execute(
+                "PRAGMA integrity_check"
+            ).fetchone()
+
+            return row[0] == "ok"
+
+        except Exception:
+
+            return False
+
+    # ==================================================
+    # BACKUP
+    # ==================================================
+
+    def backup(self, destination=None):
+
+        if destination is None:
+
+            destination = (
+                self.path + ".backup"
+            )
+
+        backup_conn = sqlite3.connect(
+            destination
+        )
+
+        try:
+
+            self.conn.backup(
+                backup_conn
+            )
+
+        finally:
+
+            backup_conn.close()
+
+        return destination
+
+    # ==================================================
+    # SETTINGS
+    # ==================================================
+
+    def get_setting(self, key):
+
+        row = self.conn.execute(
             """
-            SELECT
-                user_id,
-                minecraft_username,
-                created_at
-            FROM results
-            ORDER BY id ASC
-            """
-        ).fetchall()
+            SELECT value
+            FROM settings
+            WHERE key=?
+            """,
+            (key,)
+        ).fetchone()
 
-        if not users:
-            return
+        if not row:
+            return None
 
-        grouped = {}
+        return row["value"]
 
-        for row in users:
+    def save_setting(self, key, value):
 
-            grouped[row["user_id"]] = row
+        now = datetime.now(
+            timezone.utc
+        ).isoformat()
 
-        for user_id in grouped:
+        with self.transaction():
 
-            latest = self.conn.execute(
+            self.conn.execute(
                 """
-                SELECT
-                    minecraft_username,
-                    tier,
-                    points,
-                    created_at
-                FROM results
-                WHERE user_id=?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (user_id,)
-            ).fetchone()
+                INSERT INTO settings(
+                    key,
+                    value,
+                    updated_at
+                )
+                VALUES(?, ?, ?)
 
-            stats = self.conn.execute(
-                """
-                SELECT
-                    COALESCE(SUM(points), 0) AS total_points,
-                    COUNT(*) AS total_tests
-                FROM results
-                WHERE user_id=?
+                ON CONFLICT(key)
+                DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
                 """,
-                (user_id,)
-            ).fetchone()
+                (
+                    key,
+                    str(value),
+                    now
+                )
+            )
 
-            first = self.conn.execute(
-                """
-                SELECT created_at
-                FROM results
-                WHERE user_id=?
-                ORDER BY id ASC
-                LIMIT 1
-                """,
-                (user_id,)
-            ).fetchone()
+    # ==================================================
+    # TIER POINTS
+    # ==================================================
+
+    def points_for_tier(self, tier):
+
+        return self.TIER_POINTS.get(
+            tier.upper(),
+            0
+        )
+
+    # ==================================================
+    # PLAYER
+    # ==================================================
+
+    def upsert_player(
+        self,
+        user_id,
+        minecraft_username,
+        region="No Region"
+    ):
+
+        timestamp = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        with self.transaction():
 
             self.conn.execute(
                 """
                 INSERT INTO players(
                     user_id,
                     minecraft_username,
-                    current_tier,
-                    current_points,
-                    total_tests,
-                    first_seen_at,
+                    region,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?)
+
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    minecraft_username=excluded.minecraft_username,
+                    region=excluded.region,
+                    updated_at=excluded.updated_at
                 """,
                 (
                     user_id,
-                    latest["minecraft_username"],
-                    latest["tier"],
-                    stats["total_points"],
-                    stats["total_tests"],
-                    first["created_at"],
-                    latest["created_at"]
+                    minecraft_username,
+                    region or "No Region",
+                    timestamp
                 )
             )
-
-    # ======================================================
-    # NORMALIZATION
-    # ======================================================
-
-    @classmethod
-    def normalize_tier(cls, tier):
-
-        if tier is None:
-            return None
-
-        tier = str(tier).strip().upper()
-
-        if tier not in cls.TIER_POINTS:
-            return None
-
-        return tier
-
-    @classmethod
-    def points_for_tier(cls, tier):
-
-        tier = cls.normalize_tier(tier)
-
-        if tier is None:
-            return None
-
-        return cls.TIER_POINTS[tier]
-
-    # ======================================================
-    # PLAYER
-    # ======================================================
-
-    def upsert_player(
-        self,
-        user_id,
-        minecraft_username,
-        timestamp
-    ):
-
-        with self.transaction():
-
-            existing = self.conn.execute(
-                """
-                SELECT 1
-                FROM players
-                WHERE user_id=?
-                """,
-                (user_id,)
-            ).fetchone()
-
-            if existing:
-
-                self.conn.execute(
-                    """
-                    UPDATE players
-                    SET
-                        minecraft_username=?,
-                        updated_at=?
-                    WHERE user_id=?
-                    """,
-                    (
-                        minecraft_username,
-                        timestamp,
-                        user_id
-                    )
-                )
-
-            else:
-
-                self.conn.execute(
-                    """
-                    INSERT INTO players(
-                        user_id,
-                        minecraft_username,
-                        current_tier,
-                        current_points,
-                        total_tests,
-                        first_seen_at,
-                        updated_at
-                    )
-                    VALUES (?, ?, NULL, 0, 0, ?, ?)
-                    """,
-                    (
-                        user_id,
-                        minecraft_username,
-                        timestamp,
-                        timestamp
-                    )
-                )
 
     def player(self, user_id):
 
@@ -491,9 +413,9 @@ class Database:
             (user_id,)
         ).fetchone()
 
-    # ======================================================
+    # ==================================================
     # QUEUES
-    # ======================================================
+    # ==================================================
 
     def queue_join(
         self,
@@ -505,9 +427,13 @@ class Database:
         limit=15
     ):
 
-        gamemode = str(gamemode).strip()
-        minecraft_username = minecraft_username.strip()
-        preferred_server = preferred_server.strip()
+        minecraft_username = (
+            minecraft_username.strip()
+        )
+
+        preferred_server = (
+            preferred_server.strip()
+        )
 
         if not minecraft_username:
             return False, "invalid_username"
@@ -519,7 +445,7 @@ class Database:
 
             existing = self.conn.execute(
                 """
-                SELECT 1
+                SELECT user_id
                 FROM queues
                 WHERE user_id=?
                 """,
@@ -550,7 +476,7 @@ class Database:
                     preferred_server,
                     joined_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -567,15 +493,13 @@ class Database:
 
         with self.transaction():
 
-            cursor = self.conn.execute(
+            self.conn.execute(
                 """
                 DELETE FROM queues
                 WHERE user_id=?
                 """,
                 (user_id,)
             )
-
-            return cursor.rowcount == 1
 
     def queue_remove_mode_user(
         self,
@@ -585,7 +509,7 @@ class Database:
 
         with self.transaction():
 
-            cursor = self.conn.execute(
+            self.conn.execute(
                 """
                 DELETE FROM queues
                 WHERE gamemode=?
@@ -596,8 +520,6 @@ class Database:
                     user_id
                 )
             )
-
-            return cursor.rowcount == 1
 
     def queue_for_user(self, user_id):
 
@@ -643,11 +565,14 @@ class Database:
             (gamemode,)
         ).fetchone()[0]
 
-    # ======================================================
+    # ==================================================
     # TICKETS
-    # ======================================================
+    # ==================================================
 
-    def active_ticket_for_user(self, user_id):
+    def active_ticket_for_user(
+        self,
+        user_id
+    ):
 
         return self.conn.execute(
             """
@@ -661,9 +586,25 @@ class Database:
             (user_id,)
         ).fetchone()
 
-    def ticket_for_user(self, user_id):
+    def ticket_for_user(
+        self,
+        user_id
+    ):
 
-        return self.active_ticket_for_user(user_id)
+        return self.active_ticket_for_user(
+            user_id
+        )
+
+    def ticket(self, channel_id):
+
+        return self.conn.execute(
+            """
+            SELECT *
+            FROM tickets
+            WHERE channel_id=?
+            """,
+            (channel_id,)
+        ).fetchone()
 
     def create_ticket(
         self,
@@ -675,47 +616,60 @@ class Database:
         created_at
     ):
 
-        with self.transaction():
+        try:
 
-            existing = self.conn.execute(
-                """
-                SELECT 1
-                FROM tickets
-                WHERE user_id=?
-                AND status IN ('waiting', 'testing')
-                LIMIT 1
-                """,
-                (user_id,)
-            ).fetchone()
+            with self.transaction():
 
-            if existing:
-                return False
-
-            self.conn.execute(
-                """
-                INSERT INTO tickets(
-                    channel_id,
-                    user_id,
-                    gamemode,
-                    minecraft_username,
-                    preferred_server,
-                    tester_id,
-                    status,
-                    created_at
+                self.conn.execute(
+                    """
+                    INSERT INTO tickets(
+                        channel_id,
+                        user_id,
+                        gamemode,
+                        minecraft_username,
+                        preferred_server,
+                        status,
+                        created_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, 'waiting', ?)
+                    """,
+                    (
+                        channel_id,
+                        user_id,
+                        gamemode,
+                        minecraft_username,
+                        preferred_server,
+                        created_at
+                    )
                 )
-                VALUES (?, ?, ?, ?, ?, NULL, 'waiting', ?)
-                """,
-                (
-                    channel_id,
-                    user_id,
-                    gamemode,
-                    minecraft_username,
-                    preferred_server,
-                    created_at
-                )
-            )
 
-        return True
+                self.conn.execute(
+                    """
+                    INSERT INTO players(
+                        user_id,
+                        minecraft_username,
+                        region,
+                        updated_at
+                    )
+                    VALUES(?, ?, 'No Region', ?)
+
+                    ON CONFLICT(user_id)
+                    DO UPDATE SET
+                        minecraft_username=excluded.minecraft_username,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        user_id,
+                        minecraft_username,
+                        created_at
+                    )
+                )
+
+            return True
+
+        except sqlite3.IntegrityError:
+
+            return False
 
     def claim_ticket(
         self,
@@ -745,27 +699,16 @@ class Database:
 
             return cursor.rowcount == 1
 
-    def ticket(self, channel_id):
-
-        return self.conn.execute(
-            """
-            SELECT *
-            FROM tickets
-            WHERE channel_id=?
-            """,
-            (channel_id,)
-        ).fetchone()
-
     def close_ticket(
         self,
         channel_id,
         closed_at,
-        reason="closed"
+        reason=None
     ):
 
         with self.transaction():
 
-            cursor = self.conn.execute(
+            self.conn.execute(
                 """
                 UPDATE tickets
                 SET
@@ -773,7 +716,7 @@ class Database:
                     closed_at=?,
                     close_reason=?
                 WHERE channel_id=?
-                AND status != 'closed'
+                AND status!='closed'
                 """,
                 (
                     closed_at,
@@ -782,11 +725,9 @@ class Database:
                 )
             )
 
-            return cursor.rowcount == 1
-
-    # ======================================================
+    # ==================================================
     # FINALIZE TEST
-    # ======================================================
+    # ==================================================
 
     def finalize_test(
         self,
@@ -803,20 +744,14 @@ class Database:
         closed_at
     ):
 
-        tier = self.normalize_tier(tier)
+        tier = tier.upper()
 
-        if tier is None:
-            return False
-
-        automatic_points = self.points_for_tier(
+        actual_points = self.points_for_tier(
             tier
         )
 
-        if automatic_points is None:
+        if actual_points <= 0:
             return False
-
-        # NEVER trust points supplied by Discord/modal code.
-        points = automatic_points
 
         with self.transaction():
 
@@ -826,38 +761,17 @@ class Database:
                 FROM tickets
                 WHERE channel_id=?
                 AND status='testing'
-                """,
-                (channel_id,)
-            ).fetchone()
-
-            if not ticket:
-                return False
-
-            if ticket["user_id"] != user_id:
-                return False
-
-            if ticket["tester_id"] != tester_id:
-                return False
-
-            cursor = self.conn.execute(
-                """
-                UPDATE tickets
-                SET
-                    status='closed',
-                    closed_at=?,
-                    close_reason='test_completed'
-                WHERE channel_id=?
-                AND status='testing'
+                AND user_id=?
                 AND tester_id=?
                 """,
                 (
-                    closed_at,
                     channel_id,
+                    user_id,
                     tester_id
                 )
-            )
+            ).fetchone()
 
-            if cursor.rowcount != 1:
+            if not ticket:
                 return False
 
             self.conn.execute(
@@ -873,7 +787,7 @@ class Database:
                     verdict,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -881,231 +795,360 @@ class Database:
                     gamemode,
                     tier,
                     tester_id,
-                    automatic_points,
+                    actual_points,
                     match_score,
                     verdict,
                     created_at
                 )
             )
 
-            # Update player cache.
-            stats = self.conn.execute(
+            self.conn.execute(
                 """
-                SELECT
-                    COALESCE(SUM(points), 0) AS total_points,
-                    COUNT(*) AS total_tests
-                FROM results
-                WHERE user_id=?
+                UPDATE tickets
+                SET
+                    status='closed',
+                    closed_at=?,
+                    close_reason='test_completed'
+                WHERE channel_id=?
                 """,
-                (user_id,)
-            ).fetchone()
+                (
+                    closed_at,
+                    channel_id
+                )
+            )
+
+            self._rebuild_player(
+                user_id,
+                minecraft_username
+            )
+
+        return True
+
+    # ==================================================
+    # PLAYER AGGREGATES
+    # ==================================================
+
+    def _rebuild_player(
+        self,
+        user_id,
+        minecraft_username=None
+    ):
+
+        rows = self.conn.execute(
+            """
+            SELECT
+                tier,
+                points,
+                created_at
+            FROM results
+            WHERE user_id=?
+            AND corrected=0
+            ORDER BY created_at DESC, id DESC
+            """,
+            (user_id,)
+        ).fetchall()
+
+        total_points = sum(
+            row["points"]
+            for row in rows
+        )
+
+        total_tests = len(rows)
+
+        current_tier = (
+            rows[0]["tier"]
+            if rows
+            else None
+        )
+
+        if minecraft_username is None:
 
             existing = self.conn.execute(
                 """
-                SELECT 1
+                SELECT minecraft_username
                 FROM players
                 WHERE user_id=?
                 """,
                 (user_id,)
             ).fetchone()
 
-            if existing:
+            minecraft_username = (
+                existing["minecraft_username"]
+                if existing
+                else "Unknown"
+            )
 
-                self.conn.execute(
-                    """
-                    UPDATE players
-                    SET
-                        minecraft_username=?,
-                        current_tier=?,
-                        current_points=?,
-                        total_tests=?,
-                        updated_at=?
-                    WHERE user_id=?
-                    """,
-                    (
-                        minecraft_username,
-                        tier,
-                        automatic_points,
-                        stats["total_tests"],
-                        created_at,
-                        user_id
-                    )
+        timestamp = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        self.conn.execute(
+            """
+            INSERT INTO players(
+                user_id,
+                minecraft_username,
+                region,
+                current_tier,
+                total_points,
+                total_tests,
+                updated_at
+            )
+            VALUES(
+                ?,
+                ?,
+                'No Region',
+                ?,
+                ?,
+                ?,
+                ?
+            )
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                minecraft_username=excluded.minecraft_username,
+                current_tier=excluded.current_tier,
+                total_points=excluded.total_points,
+                total_tests=excluded.total_tests,
+                updated_at=excluded.updated_at
+            """,
+            (
+                user_id,
+                minecraft_username,
+                current_tier,
+                total_points,
+                total_tests,
+                timestamp
+            )
+        )
+
+    def rebuild_all_players(self):
+
+        users = self.conn.execute(
+            """
+            SELECT DISTINCT user_id
+            FROM results
+            """
+        ).fetchall()
+
+        with self.transaction():
+
+            for row in users:
+
+                self._rebuild_player(
+                    row["user_id"]
                 )
 
-            else:
-
-                self.conn.execute(
-                    """
-                    INSERT INTO players(
-                        user_id,
-                        minecraft_username,
-                        current_tier,
-                        current_points,
-                        total_tests,
-                        first_seen_at,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        user_id,
-                        minecraft_username,
-                        tier,
-                        automatic_points,
-                        stats["total_tests"],
-                        created_at,
-                        created_at
-                    )
-                )
-
-        return True
-
-    # ======================================================
+    # ==================================================
     # RESULTS
-    # ======================================================
+    # ==================================================
 
-    def latest_results(self):
+    def latest_results(self, limit=100):
 
         return self.conn.execute(
             """
             SELECT *
             FROM results
-            ORDER BY id DESC
-            """
+            WHERE corrected=0
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,)
         ).fetchall()
 
-    def results_for_user(self, user_id):
+    def results_for_user(
+        self,
+        user_id
+    ):
 
         return self.conn.execute(
             """
             SELECT *
             FROM results
             WHERE user_id=?
-            ORDER BY id DESC
+            ORDER BY created_at DESC, id DESC
             """,
             (user_id,)
         ).fetchall()
 
-    def result(self, result_id):
+    # ==================================================
+    # STATS
+    # ==================================================
 
-        return self.conn.execute(
-            """
-            SELECT *
-            FROM results
-            WHERE id=?
-            """,
-            (result_id,)
-        ).fetchone()
+    def stats_player(
+        self,
+        user_id
+    ):
 
-    # ======================================================
-    # GLOBAL LEADERBOARD
-    # ======================================================
-
-    def global_leaderboard(self):
-
-        return self.conn.execute(
+        player = self.conn.execute(
             """
             SELECT
                 user_id,
-                MAX(minecraft_username) AS minecraft_username,
-                SUM(points) AS total_points,
-                COUNT(*) AS tests
-            FROM results
-            GROUP BY user_id
-            ORDER BY
-                total_points DESC,
-                tests DESC,
-                minecraft_username ASC
-            """
-        ).fetchall()
-
-    def global_rank_for_user(self, user_id):
-
-        rows = self.global_leaderboard()
-
-        for position, row in enumerate(
-            rows,
-            start=1
-        ):
-
-            if row["user_id"] == user_id:
-
-                return {
-                    "rank": position,
-                    "user_id": row["user_id"],
-                    "minecraft_username": row["minecraft_username"],
-                    "total_points": row["total_points"],
-                    "tests": row["tests"]
-                }
-
-        return None
-
-    def global_points_for_user(self, user_id):
-
-        result = self.conn.execute(
-            """
-            SELECT
-                COALESCE(SUM(points), 0)
-                AS total_points
-            FROM results
+                minecraft_username,
+                region,
+                current_tier,
+                total_points,
+                total_tests
+            FROM players
             WHERE user_id=?
             """,
             (user_id,)
         ).fetchone()
 
-        return result["total_points"]
+        if not player:
 
-    # ======================================================
-    # GAMEMODE LEADERBOARD
-    # ======================================================
+            return None
 
-    def gamemode_leaderboard(
+        return player
+
+    def stats_gamemodes(
         self,
-        gamemode
+        user_id
+    ):
+
+        rows = self.conn.execute(
+            """
+            SELECT
+                r.*
+            FROM results r
+            INNER JOIN (
+                SELECT
+                    gamemode,
+                    MAX(id) AS latest_id
+                FROM results
+                WHERE user_id=?
+                AND corrected=0
+                GROUP BY gamemode
+            ) latest
+            ON latest.latest_id = r.id
+            WHERE r.user_id=?
+            AND r.corrected=0
+            """,
+            (
+                user_id,
+                user_id
+            )
+        ).fetchall()
+
+        return {
+            row["gamemode"]: row
+            for row in rows
+        }
+
+    def global_rank(
+        self,
+        user_id
+    ):
+
+        rows = self.conn.execute(
+            """
+            SELECT
+                user_id,
+                SUM(points) AS total_points
+            FROM results
+            WHERE corrected=0
+            GROUP BY user_id
+            ORDER BY total_points DESC, user_id ASC
+            """
+        ).fetchall()
+
+        for index, row in enumerate(
+            rows,
+            1
+        ):
+
+            if row["user_id"] == user_id:
+                return index
+
+        return None
+
+    # ==================================================
+    # GLOBAL LEADERBOARD
+    # ==================================================
+
+    def global_leaderboard(
+        self,
+        limit=100
     ):
 
         return self.conn.execute(
             """
             SELECT
-                user_id,
-                MAX(minecraft_username) AS minecraft_username,
-                SUM(points) AS total_points,
-                COUNT(*) AS tests
-            FROM results
-            WHERE gamemode=?
-            GROUP BY user_id
+                p.user_id,
+                p.minecraft_username,
+                COALESCE(
+                    SUM(r.points),
+                    0
+                ) AS total_points,
+                COUNT(r.id) AS tests
+            FROM players p
+            LEFT JOIN results r
+                ON r.user_id=p.user_id
+                AND r.corrected=0
+            GROUP BY
+                p.user_id
             ORDER BY
                 total_points DESC,
-                tests DESC,
-                minecraft_username ASC
+                p.user_id ASC
+            LIMIT ?
             """,
-            (gamemode,)
+            (limit,)
         ).fetchall()
 
-    # ======================================================
+    # ==================================================
+    # GAMEMODE LEADERBOARD
+    # ==================================================
+
+    def gamemode_leaderboard(
+        self,
+        gamemode,
+        limit=100
+    ):
+
+        return self.conn.execute(
+            """
+            SELECT
+                r.user_id,
+                r.minecraft_username,
+                MAX(r.points) AS total_points,
+                COUNT(r.id) AS tests
+            FROM results r
+            WHERE r.gamemode=?
+            AND r.corrected=0
+            GROUP BY r.user_id
+            ORDER BY
+                total_points DESC,
+                r.user_id ASC
+            LIMIT ?
+            """,
+            (
+                gamemode,
+                limit
+            )
+        ).fetchall()
+
+    # ==================================================
     # CORRECT RESULT
-    # ======================================================
+    # ==================================================
 
     def correct_result(
         self,
         result_id,
         tier,
-        corrected_by=None,
-        corrected_at=None
+        corrected_by=None
     ):
 
-        tier = self.normalize_tier(tier)
+        tier = tier.upper()
 
-        if tier is None:
+        if tier not in self.TIER_POINTS:
             return False
 
-        automatic_points = self.points_for_tier(
+        points = self.points_for_tier(
             tier
         )
 
         with self.transaction():
 
-            old = self.conn.execute(
+            row = self.conn.execute(
                 """
                 SELECT *
                 FROM results
@@ -1114,19 +1157,12 @@ class Database:
                 (result_id,)
             ).fetchone()
 
-            if not old:
+            if not row:
                 return False
 
-            original_tier = (
-                old["original_tier"]
-                or old["tier"]
-            )
-
-            original_points = (
-                old["original_points"]
-                if old["original_points"] is not None
-                else old["points"]
-            )
+            timestamp = datetime.now(
+                timezone.utc
+            ).isoformat()
 
             self.conn.execute(
                 """
@@ -1136,98 +1172,23 @@ class Database:
                     points=?,
                     corrected=1,
                     corrected_at=?,
-                    corrected_by=?,
-                    original_tier=?,
-                    original_points=?
+                    corrected_by=?
                 WHERE id=?
                 """,
                 (
                     tier,
-                    automatic_points,
-                    corrected_at,
+                    points,
+                    timestamp,
                     corrected_by,
-                    original_tier,
-                    original_points,
                     result_id
                 )
             )
 
-            # Recalculate player's cached data.
-            user_id = old["user_id"]
-
-            stats = self.conn.execute(
-                """
-                SELECT
-                    COALESCE(SUM(points), 0) AS total_points,
-                    COUNT(*) AS total_tests
-                FROM results
-                WHERE user_id=?
-                """,
-                (user_id,)
-            ).fetchone()
-
-            latest = self.conn.execute(
-                """
-                SELECT
-                    minecraft_username,
-                    tier,
-                    created_at
-                FROM results
-                WHERE user_id=?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (user_id,)
-            ).fetchone()
-
-            if latest:
-
-                self.conn.execute(
-                    """
-                    UPDATE players
-                    SET
-                        minecraft_username=?,
-                        current_tier=?,
-                        current_points=?,
-                        total_tests=?,
-                        updated_at=?
-                    WHERE user_id=?
-                    """,
-                    (
-                        latest["minecraft_username"],
-                        latest["tier"],
-                        stats["total_points"],
-                        stats["total_tests"],
-                        corrected_at or latest["created_at"],
-                        user_id
-                    )
-                )
+            # Recalculate the player.
+            # Corrected records are excluded from totals.
+            self._rebuild_player(
+                row["user_id"]
+            )
 
         return True
-
-    # ======================================================
-    # DATABASE HEALTH
-    # ======================================================
-
-    def integrity_check(self):
-
-        return self.conn.execute(
-            "PRAGMA integrity_check"
-        ).fetchone()[0]
-
-    def vacuum(self):
-
-        self.conn.execute(
-            "VACUUM"
-        )
-
-    # ======================================================
-    # CLOSE
-    # ======================================================
-
-    def close(self):
-
-        try:
-            self.conn.commit()
-        finally:
-            self.conn.close()
+```
