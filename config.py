@@ -158,3 +158,32 @@ TIER_POINTS = {
     tier: (len(TIERS) - rank) * 100
     for tier, rank in TIER_RANK.items()
 }
+
+# ======================================================
+# VOICE TTS
+# ======================================================
+
+TTS_ENABLED = os.getenv(
+    "TTS_ENABLED",
+    "true"
+).lower() == "true"
+
+TTS_VOICE = os.getenv(
+    "TTS_VOICE",
+    "en-IN-PrabhatNeural"
+)
+
+TTS_RATE = os.getenv(
+    "TTS_RATE",
+    "+0%"
+)
+
+TTS_VOLUME = os.getenv(
+    "TTS_VOLUME",
+    "+0%"
+)
+
+TTS_PITCH = os.getenv(
+    "TTS_PITCH",
+    "+0Hz"
+)
